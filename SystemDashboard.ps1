@@ -1,41 +1,64 @@
 <#
 .SYNOPSIS
-    Imports system inventory data to SQL Server
+    System Inventory Dashboard Web Server
+.DESCRIPTION
+    Creates a local web dashboard to view system inventory from SQL database
+    Runs on port 8080 with search functionality
 .COMPANY
-    Your Company Name
+    North West Provincial Treasury 
 .AUTHOR
-    Your Name
+    Lesedi Sebekedi
 .VERSION
-    1.0
+    2.0
 .SECURITY
-    Requires SQL write permissions
+    Requires SQL read permissions and local admin for port binding
 #>
 
+# Import required modules
 Import-Module SqlServer
 
+# REGION: WEB SERVER CONFIGURATION
+# -------------------------------
 $port = 8080
 $listener = New-Object System.Net.HttpListener
 $listener.Prefixes.Add("http://localhost:$port/")
 
 try {
     $listener.Start()
-    Write-Host "Dashboard running at http://localhost:$port"
+    Write-Host "Dashboard running at http://localhost:$port" -ForegroundColor Green
 }
 catch {
     Write-Host "Failed to start HTTP listener: $_" -ForegroundColor Red
     exit 1
 }
 
-function Encode-HTML([string]$text) {
-    if (-not $text) { return "" }
+# REGION: HELPER FUNCTIONS
+# ------------------------
+
+function Encode-HTML {
+    <#
+    .SYNOPSIS
+        Encodes text for safe HTML output
+    #>
+    param([string]$text)
+    
+    if ([string]::IsNullOrEmpty($text)) { 
+        return "" 
+    }
     return [System.Net.WebUtility]::HtmlEncode($text)
 }
 
-function Parse-QueryString([string]$query) {
+function Parse-QueryString {
+    <#
+    .SYNOPSIS
+        Parses URL query string into key-value pairs
+    #>
+    param([string]$query)
+    
     $query = $query.TrimStart('?')
     $dict = @{}
 
-    if ($query -ne "") {
+    if (-not [string]::IsNullOrEmpty($query)) {
         $query.Split('&') | ForEach-Object {
             $key, $value = $_.Split('=', 2)
             $dict[$key] = [System.Uri]::UnescapeDataString($value)
@@ -45,64 +68,126 @@ function Parse-QueryString([string]$query) {
     return $dict
 }
 
-function Escape-SqlLike([string]$input) {
-    if (-not $input) { return "" }
-    # Escape SQL LIKE wildcards by surrounding with []
+function Escape-SqlLike {
+    <#
+    .SYNOPSIS
+        Escapes special characters for SQL LIKE queries
+    #>
+    param([string]$input)
+    
+    if ([string]::IsNullOrEmpty($input)) { 
+        return "" 
+    }
+    # Escape SQL wildcards by surrounding with []
     return $input -replace '([%_\[\]])', '[$1]'
 }
 
+function Get-SystemRecords {
+    <#
+    .SYNOPSIS
+        Retrieves system records from database with optional search
+    #>
+    param(
+        [string]$searchTerm,
+        [string]$connectionString
+    )
+    
+    # Configure secure connection
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+    
+    if ([string]::IsNullOrWhiteSpace($searchTerm)) {
+        $sqlQuery = @"
+        SELECT TOP 20 
+            s.AssetNumber, 
+            s.HostName, 
+            sp.OSName, 
+            sp.TotalRAMGB,
+            s.ScanDate
+        FROM Systems s
+        JOIN SystemSpecs sp ON s.SystemID = sp.SystemID
+        ORDER BY s.ScanDate DESC
+"@
+    }
+    else {
+        $escapedSearchTerm = Escape-SqlLike $searchTerm
+        $searchPattern = "%$escapedSearchTerm%"
+
+        $sqlQuery = @"
+        SELECT TOP 20 
+            s.AssetNumber, 
+            s.HostName, 
+            sp.OSName, 
+            sp.TotalRAMGB,
+            s.ScanDate
+        FROM Systems s
+        JOIN SystemSpecs sp ON s.SystemID = sp.SystemID
+        WHERE s.AssetNumber LIKE '$searchPattern' ESCAPE '[' 
+           OR s.HostName LIKE '$searchPattern' ESCAPE '['
+        ORDER BY s.ScanDate DESC
+"@
+    }
+
+    return Invoke-Sqlcmd -ConnectionString $connectionString -Query $sqlQuery
+}
+
+function Show-ErrorPage {
+    <#
+    .SYNOPSIS
+        Displays error page when exceptions occur
+    #>
+    param($response, $errorMessage)
+    
+    $errorHtml = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Error</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto px-4 py-8">
+        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative" role="alert">
+            <strong class="font-bold">Application Error!</strong>
+            <span class="block sm:inline">$($errorMessage)</span>
+        </div>
+    </div>
+</body>
+</html>
+"@
+    $buffer = [System.Text.Encoding]::UTF8.GetBytes($errorHtml)
+    $response.ContentLength64 = $buffer.Length
+    $response.ContentType = "text/html; charset=utf-8"
+    $response.OutputStream.Write($buffer, 0, $buffer.Length)
+    $response.OutputStream.Close()
+}
+
+# REGION: MAIN WEB SERVER LOOP
+# ----------------------------
 while ($listener.IsListening) {
     try {
+        # Get HTTP context
         $context = $listener.GetContext()
         $request = $context.Request
         $response = $context.Response
 
-        # Parse search query parameter
+        # Parse search query if present
         $searchTerm = ""
-        if ($request.Url.Query) {
+        if (-not [string]::IsNullOrEmpty($request.Url.Query)) {
             $queryParams = Parse-QueryString $request.Url.Query
             $searchTerm = $queryParams["search"]
         }
 
-        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+        # Database configuration
         $connectionString = "Server=PTLSEBEKEDI;Database=AssetDB;Integrated Security=True;TrustServerCertificate=True"
+        
+        # Get systems from database
+        $systems = Get-SystemRecords -searchTerm $searchTerm -connectionString $connectionString
 
-        if ([string]::IsNullOrWhiteSpace($searchTerm)) {
-            $sqlQuery = @"
-SELECT TOP 20 
-    s.AssetNumber, 
-    s.HostName, 
-    sp.OSName, 
-    sp.TotalRAMGB,
-    s.ScanDate
-FROM Systems s
-JOIN SystemSpecs sp ON s.SystemID = sp.SystemID
-ORDER BY s.ScanDate DESC
-"@
-        }
-        else {
-            $escapedSearchTerm = Escape-SqlLike $searchTerm
-            $searchPattern = "%$escapedSearchTerm%"
-
-            $sqlQuery = @"
-SELECT TOP 20 
-    s.AssetNumber, 
-    s.HostName, 
-    sp.OSName, 
-    sp.TotalRAMGB,
-    s.ScanDate
-FROM Systems s
-JOIN SystemSpecs sp ON s.SystemID = sp.SystemID
-WHERE s.AssetNumber LIKE '$searchPattern' ESCAPE '[' OR s.HostName LIKE '$searchPattern' ESCAPE '['
-ORDER BY s.ScanDate DESC
-"@
-        }
-
-        $systems = Invoke-Sqlcmd -ConnectionString $connectionString -Query $sqlQuery
-
+        # Prepare HTML response
         $escapedSearch = Encode-HTML $searchTerm
         $currentDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
+        # Build HTML header
         $html = @"
 <!DOCTYPE html>
 <html lang="en">
@@ -162,6 +247,7 @@ ORDER BY s.ScanDate DESC
                     <tbody class="bg-white divide-y divide-gray-200">
 "@
 
+        # Add table rows for each system
         foreach ($sys in $systems) {
             $assetNum = Encode-HTML $sys.AssetNumber
             $hostName = Encode-HTML $sys.HostName
@@ -180,6 +266,7 @@ ORDER BY s.ScanDate DESC
 "@
         }
 
+        # Close HTML document
         $html += @"
                     </tbody>
                 </table>
@@ -195,39 +282,19 @@ ORDER BY s.ScanDate DESC
 </html>
 "@
 
+        # Send response
         $buffer = [System.Text.Encoding]::UTF8.GetBytes($html)
         $response.ContentLength64 = $buffer.Length
         $response.ContentType = "text/html; charset=utf-8"
-        $output = $response.OutputStream
-        $output.Write($buffer, 0, $buffer.Length)
-        $output.Close()
+        $response.OutputStream.Write($buffer, 0, $buffer.Length)
+        $response.OutputStream.Close()
     }
     catch {
         Write-Warning "Error processing request: $_"
-        $errorHtml = @"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Error</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-100">
-    <div class="container mx-auto px-4 py-8">
-        <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative" role="alert">
-            <strong class="font-bold">Application Error!</strong>
-            <span class="block sm:inline">An unexpected error occurred while processing your request.</span>
-        </div>
-    </div>
-</body>
-</html>
-"@
-        $errorBuffer = [System.Text.Encoding]::UTF8.GetBytes($errorHtml)
-        $response.ContentLength64 = $errorBuffer.Length
-        $response.ContentType = "text/html; charset=utf-8"
-        $output = $response.OutputStream
-        $output.Write($errorBuffer, 0, $errorBuffer.Length)
-        $output.Close()
+        Show-ErrorPage -response $response -errorMessage "An unexpected error occurred while processing your request."
     }
 }
 
+# Clean up
 $listener.Stop()
+Write-Host "Dashboard server stopped" -ForegroundColor Yellow

@@ -1,84 +1,129 @@
-# SystemInfoCollector.ps1
-# Collects detailed system information and saves it to a JSON file on the desktop.
+<#
+    .SYNOPSIS
+        Collects comprehensive system information and exports to JSON
+    .DESCRIPTION
+        Gathers hardware, software, and network configuration details
+        Compatible with PowerShell 2.0 through latest versions
+        Outputs structured JSON file to user's desktop
+
+    .COMPANY
+        North West Provincial Treasury 
+    .AUTHOR
+        Lesedi Sebekedi
+#>
+
 function Get-SystemInfo {
     [CmdletBinding()]
     param()
 
     try {
-        # Detect PowerShell version and set appropriate cmdlets
+        # Determine if we can use modern CIM cmdlets (PowerShell 3.0+) or fallback to WMI
         $useCim = $PSVersionTable.PSVersion.Major -ge 3
         
-        # 1. Basic System Info (Compatible with all Windows versions)
+        # REGION: BASIC SYSTEM INFORMATION
+        # -------------------------------
+        # Collect core system details (OS, BIOS, computer model)
         if ($useCim) {
             $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
             $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
             $bios = Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop
-        } else {
+        } 
+        else {
             $computerSystem = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop
             $os = Get-WmiObject -Class Win32_OperatingSystem -ErrorAction Stop
             $bios = Get-WmiObject -Class Win32_BIOS -ErrorAction Stop
         }
 
-        # 2. CPU Info (Works with modern Intel/AMD)
-        if ($useCim) {
-            $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | Select-Object Name, 
-                @{Name="Cores"; Expression={$_.NumberOfCores}},
-                @{Name="Threads"; Expression={$_.NumberOfLogicalProcessors}},
+        # REGION: PROCESSOR INFORMATION
+        # ----------------------------
+        # Get CPU details including cores, threads and clock speed
+        $cpuParams = @{
+            Property = @(
+                'Name'
+                @{Name="Cores"; Expression={$_.NumberOfCores}}
+                @{Name="Threads"; Expression={$_.NumberOfLogicalProcessors}}
                 @{Name="ClockSpeed"; Expression={"$($_.MaxClockSpeed) MHz"}}
-        } else {
-            $cpu = Get-WmiObject -Class Win32_Processor -ErrorAction Stop | Select-Object Name, 
-                @{Name="Cores"; Expression={$_.NumberOfCores}},
-                @{Name="Threads"; Expression={$_.NumberOfLogicalProcessors}},
-                @{Name="ClockSpeed"; Expression={"$($_.MaxClockSpeed) MHz"}}
+            )
         }
 
-        # 3. Memory (Physical + Virtual)
+        if ($useCim) {
+            $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | Select-Object @cpuParams
+        } 
+        else {
+            $cpu = Get-WmiObject -Class Win32_Processor -ErrorAction Stop | Select-Object @cpuParams
+        }
+
+        # REGION: MEMORY INFORMATION
+        # --------------------------
+        # Calculate total physical memory and page file size
         if ($useCim) {
             $physicalMemory = Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction SilentlyContinue | 
-                              Measure-Object -Property Capacity -Sum
+                            Measure-Object -Property Capacity -Sum
             $pageFile = Get-CimInstance -ClassName Win32_PageFileUsage -ErrorAction SilentlyContinue | 
-                        Select-Object @{Name="PageFileGB"; Expression={[math]::Round($_.AllocatedBaseSize / 1KB, 2)}}
-        } else {
+                       Select-Object @{Name="PageFileGB"; Expression={[math]::Round($_.AllocatedBaseSize / 1KB, 2)}}
+        } 
+        else {
             $physicalMemory = Get-WmiObject -Class Win32_PhysicalMemory -ErrorAction SilentlyContinue | 
-                              Measure-Object -Property Capacity -Sum
+                            Measure-Object -Property Capacity -Sum
             $pageFile = Get-WmiObject -Class Win32_PageFileUsage -ErrorAction SilentlyContinue | 
-                        Select-Object @{Name="PageFileGB"; Expression={[math]::Round($_.AllocatedBaseSize / 1KB, 2)}}
+                       Select-Object @{Name="PageFileGB"; Expression={[math]::Round($_.AllocatedBaseSize / 1KB, 2)}}
         }
+        
         $totalMemoryGB = [math]::Round(($physicalMemory.Sum / 1GB), 2)
 
-        # 4. Disks (Including SSDs/HDDs)
-        if ($useCim) {
-            $disks = Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction SilentlyContinue | 
-                     Where-Object { $_.Size -gt 0 } | 
-                     Select-Object DeviceID, VolumeName,
-                        @{Name="SizeGB"; Expression={[math]::Round($_.Size / 1GB, 2)}},
-                        @{Name="FreeGB"; Expression={[math]::Round($_.FreeSpace / 1GB, 2)}},
-                        @{Name="Type"; Expression={switch($_.DriveType){2{"Removable"}3{"Fixed"}4{"Network"}5{"Optical"}}}}
-        } else {
-            $disks = Get-WmiObject -Class Win32_LogicalDisk -ErrorAction SilentlyContinue | 
-                     Where-Object { $_.Size -gt 0 } | 
-                     Select-Object DeviceID, VolumeName,
-                        @{Name="SizeGB"; Expression={[math]::Round($_.Size / 1GB, 2)}},
-                        @{Name="FreeGB"; Expression={[math]::Round($_.FreeSpace / 1GB, 2)}},
-                        @{Name="Type"; Expression={switch($_.DriveType){2{"Removable"}3{"Fixed"}4{"Network"}5{"Optical"}}}}
+        # REGION: STORAGE INFORMATION
+        # ---------------------------
+        # Gather disk information including size and free space
+        $diskParams = @{
+            Property = @(
+                'DeviceID'
+                'VolumeName'
+                @{Name="SizeGB"; Expression={[math]::Round($_.Size / 1GB, 2)}}
+                @{Name="FreeGB"; Expression={[math]::Round($_.FreeSpace / 1GB, 2)}}
+                @{Name="Type"; Expression={
+                    switch($_.DriveType) {
+                        2 {"Removable"}
+                        3 {"Fixed"} 
+                        4 {"Network"}
+                        5 {"Optical"}
+                    }
+                }}
+            )
         }
 
-        # 5. Network (IPv4/IPv6)
+        if ($useCim) {
+            $disks = Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction SilentlyContinue | 
+                    Where-Object { $_.Size -gt 0 } | 
+                    Select-Object @diskParams
+        } 
+        else {
+            $disks = Get-WmiObject -Class Win32_LogicalDisk -ErrorAction SilentlyContinue | 
+                    Where-Object { $_.Size -gt 0 } | 
+                    Select-Object @diskParams
+        }
+
+        # REGION: NETWORK CONFIGURATION
+        # -----------------------------
+        # Collect network adapter details with fallback for older PowerShell
         $networkAdapters = @()
+        
+        # Modern approach using NetAdapter cmdlets if available
         if (Get-Command Get-NetAdapter -ErrorAction SilentlyContinue) {
             $networkAdapters = Get-NetAdapter -Physical -ErrorAction SilentlyContinue | 
-                               Where-Object { $_.Status -eq 'Up' } | 
-                               Select-Object Name, InterfaceDescription, MacAddress, 
-                                   @{Name="Speed"; Expression={"$($_.LinkSpeed)"}},
-                                   @{Name="IPAddress"; Expression={
-                                       (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
-                                   }}
-        } else {
-            # Fallback for PowerShell 2.0 without NetAdapter cmdlets
+                             Where-Object { $_.Status -eq 'Up' } | 
+                             Select-Object Name, InterfaceDescription, MacAddress, 
+                                 @{Name="Speed"; Expression={"$($_.LinkSpeed)"}},
+                                 @{Name="IPAddress"; Expression={
+                                     (Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+                                 }}
+        }
+        # Fallback to WMI/CIM for older systems
+        else {
             if ($useCim) {
                 $nics = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -ErrorAction SilentlyContinue | 
                         Where-Object { $_.IPEnabled -eq $true }
-            } else {
+            } 
+            else {
                 $nics = Get-WmiObject -Class Win32_NetworkAdapterConfiguration -ErrorAction SilentlyContinue | 
                         Where-Object { $_.IPEnabled -eq $true }
             }
@@ -88,13 +133,15 @@ function Get-SystemInfo {
                     Name = $nic.Description
                     InterfaceDescription = $nic.Description
                     MacAddress = $nic.MACAddress
-                    Speed = "N/A"
+                    Speed = if ($nic.Speed) { "$($nic.Speed / 1MB) Mbps" } else { "N/A" }
                     IPAddress = $nic.IPAddress[0]
                 }
             }
         }
 
-        # 6. Installed Apps (Registry)
+        # REGION: INSTALLED SOFTWARE
+        # --------------------------
+        # Query registry for installed applications
         $installedApps = @()
         $regPaths = @(
             "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
@@ -104,23 +151,30 @@ function Get-SystemInfo {
         foreach ($path in $regPaths) {
             if (Test-Path $path) {
                 $apps = Get-ItemProperty $path -ErrorAction SilentlyContinue | 
-                        Where-Object { $_.DisplayName -and -not $_.SystemComponent }
+                       Where-Object { $_.DisplayName -and -not $_.SystemComponent }
                 $installedApps += $apps | Select-Object DisplayName, DisplayVersion, Publisher, InstallDate
             }
         }
 
-        # 7. System UUID and BIOS
+        # REGION: HARDWARE IDENTIFIERS
+        # ---------------------------
+        # Get system UUID and GPU information
         if ($useCim) {
             $uuid = (Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction SilentlyContinue).UUID
             $gpu = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue | 
-                   Select-Object Name, AdapterRAM, DriverVersion
-        } else {
+                   Select-Object Name, 
+                       @{Name="AdapterRAMGB"; Expression={[math]::Round($_.AdapterRAM / 1GB, 2)}}, 
+                       DriverVersion
+        } 
+        else {
             $uuid = (Get-WmiObject -Class Win32_ComputerSystemProduct -ErrorAction SilentlyContinue).UUID
             $gpu = Get-WmiObject -Class Win32_VideoController -ErrorAction SilentlyContinue | 
-                   Select-Object Name, AdapterRAM, DriverVersion
+                   Select-Object Name, 
+                       @{Name="AdapterRAMGB"; Expression={[math]::Round($_.AdapterRAM / 1GB, 2)}}, 
+                       DriverVersion
         }
 
-        # Return structured object
+        # Build and return structured system information object
         return [PSCustomObject]@{
             System = @{
                 HostName     = $env:COMPUTERNAME
@@ -141,12 +195,12 @@ function Get-SystemInfo {
                 Memory = @{
                     TotalGB    = $totalMemoryGB
                     Sticks     = $physicalMemory.Count
-                    PageFileGB = $pageFile.PageFileGB
+                    PageFileGB = if ($pageFile) { $pageFile.PageFileGB } else { 0 }
                 }
                 Disks  = $disks
                 GPU    = $gpu
             }
-            Network = $networkAdapters = if ($networkAdapters.Count -eq 1) { $networkAdapters[0] } else { $networkAdapters }
+            Network = if ($networkAdapters.Count -eq 1) { $networkAdapters[0] } else { $networkAdapters }
             Software = @{
                 InstalledApps = $installedApps
                 Hotfixes     = if (Get-Command Get-HotFix -ErrorAction SilentlyContinue) {
@@ -164,28 +218,40 @@ function Get-SystemInfo {
     }
 }
 
-# Prompt for AssetNumber
-$assetNumber = Read-Host "Please enter the Asset Number for this system (required)"
-while ([string]::IsNullOrWhiteSpace($assetNumber)) {
-    Write-Host "Asset Number cannot be empty!" -ForegroundColor Red
-    $assetNumber = Read-Host "Please enter the Asset Number for this system (required)"
-}
+# MAIN EXECUTION
+# --------------
 
+# Prompt for and validate asset number
+do {
+    $assetNumber = Read-Host "Please enter the Asset Number for this system (required)"
+    if ([string]::IsNullOrWhiteSpace($assetNumber)) {
+        Write-Host "Asset Number cannot be empty!" -ForegroundColor Red
+    }
+} while ([string]::IsNullOrWhiteSpace($assetNumber))
+
+# Collect system information
 $systemInfo = Get-SystemInfo
+
 if ($systemInfo) {
+    # Add asset number to collected data
     $systemInfo | Add-Member -NotePropertyName "AssetNumber" -NotePropertyValue $assetNumber -Force
 
+    # Create output directory if it doesn't exist
     $outputDir = "$env:USERPROFILE\Desktop\SystemReports"
-    if (-not (Test-Path $outputDir)) { New-Item -ItemType Directory -Path $outputDir | Out-Null }
+    if (-not (Test-Path $outputDir)) { 
+        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null 
+    }
 
+    # Generate output filename with sanitized computer name and timestamp
     $computerName = $env:COMPUTERNAME -replace '[\\/:*?"<>|]', '_'
     $reportPath = "$outputDir\$computerName-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
 
-    $systemInfo | ConvertTo-Json -Depth 10 | Out-File -FilePath $reportPath -Force
+    # Export data to JSON file
+    $systemInfo | ConvertTo-Json -Depth 5 | Out-File -FilePath $reportPath -Force
 
-    Write-Host "System info saved to $reportPath" -ForegroundColor Green
-} else {
-    Write-Host "Failed to collect system info" -ForegroundColor Red
+    # Provide user feedback
+    Write-Host "System information successfully saved to:`n$reportPath" -ForegroundColor Green
 }
-
-# End of SystemInfoCollector.ps1
+else {
+    Write-Host "Failed to collect system information" -ForegroundColor Red
+}
