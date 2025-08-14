@@ -11,7 +11,7 @@
     - Secure HTML rendering
 .NOTES
     Author: Your Name
-    Version: 1.2
+    Version: 1.3
     Last Updated: $(Get-Date -Format "yyyy-MM-dd")
 #>
 
@@ -61,6 +61,9 @@ $htmlHeader = @"
             width: 24px;
             height: 24px;
             margin-right: 10px;
+        }
+        .back-button {
+            margin-bottom: 20px;
         }
     </style>
 </head>
@@ -400,10 +403,7 @@ function Render-Dashboard {
         [int]$systemId = 0
     )
     
-    # Get paginated system records
-    $systemData = Get-SystemRecords -searchTerm $searchTerm -page $page
-    
-    # Build search form
+    # Build search form (this should always show)
     $searchForm = @"
         <div class="card search-box mb-4">
             <div class="card-body">
@@ -432,10 +432,35 @@ function Render-Dashboard {
 "@
 
     # Build system details section if a system ID was requested
-    $detailsSection = ""
     if ($systemId -gt 0) {
         $detailsSection = Show-SystemDetails -systemId $systemId
+        $backButton = @"
+        <div class="mb-3">
+            <a href="/?page=$page&search=$(Encode-HTML $searchTerm)" class="btn btn-outline-secondary">
+                <i class="fas fa-arrow-left me-1"></i> Back to System List
+            </a>
+        </div>
+"@
+        # Combine all components for details view
+        $output = $htmlHeader + $searchForm + $backButton + $detailsSection + $htmlFooter
+        return $output
     }
+
+    # If no system ID, show the system list view
+    $systemData = Get-SystemRecords -searchTerm $searchTerm -page $page
+    
+    # Results count indicator
+    $resultsCount = @"
+    <div class="row mb-3">
+        <div class="col">
+            <p class="results-count">
+                Showing $([math]::Min(($page - 1) * $defaultRowCount + 1, $systemData.TotalCount)) - 
+                $([math]::Min($page * $defaultRowCount, $systemData.TotalCount)) of 
+                $($systemData.TotalCount) systems
+            </p>
+        </div>
+    </div>
+"@
 
     # Build system cards for the main listing
     $systemCards = ""
@@ -472,22 +497,9 @@ function Render-Dashboard {
     # Generate pagination controls (top and bottom)
     $paginationTop = Get-PaginationHtml -currentPage $page -totalItems $systemData.TotalCount -searchTerm $searchTerm
     $paginationBottom = $paginationTop
-    
-    # Results count indicator
-    $resultsCount = @"
-    <div class="row mb-3">
-        <div class="col">
-            <p class="results-count">
-                Showing $([math]::Min(($page - 1) * $defaultRowCount + 1, $systemData.TotalCount)) - 
-                $([math]::Min($page * $defaultRowCount, $systemData.TotalCount)) of 
-                $($systemData.TotalCount) systems
-            </p>
-        </div>
-    </div>
-"@
 
-    # Combine all components into final HTML
-    $output = $htmlHeader + $searchForm + $detailsSection + $resultsCount + $paginationTop + @"
+    # Combine all components for list view
+    $output = $htmlHeader + $searchForm + $resultsCount + $paginationTop + @"
         <div class="row">
             $systemCards
         </div>
