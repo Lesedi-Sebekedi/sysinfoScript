@@ -97,29 +97,6 @@ function Import-SystemRecord {
     }
 }
 
-function Clear-SystemDetails {
-    <#
-    .SYNOPSIS
-        Clears existing system details before importing new ones
-    #>
-    param(
-        [int]$SystemId,
-        [System.Data.SqlClient.SqlConnection]$Connection,
-        [System.Data.SqlClient.SqlTransaction]$Transaction,
-        [string[]]$Tables = @("SystemSpecs", "SystemDisks", "InstalledApps")
-    )
-    
-    foreach ($table in $Tables) {
-        $deleteCmd = $Connection.CreateCommand()
-        $deleteCmd.Transaction = $Transaction
-        $deleteCmd.CommandText = "DELETE FROM $table WHERE SystemID = @SystemID"
-        
-        $deleteCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@SystemID", [System.Data.SqlDbType]::Int))).Value = $SystemId
-        
-        $deleteCmd.ExecuteNonQuery() | Out-Null
-    }
-}
-
 function Import-SystemSpecs {
     <#
     .SYNOPSIS

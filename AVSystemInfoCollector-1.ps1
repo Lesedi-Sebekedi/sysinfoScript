@@ -3,15 +3,10 @@
     Windows 7 System Information Collector with Enhanced Network Details
 .DESCRIPTION
     Collects essential system information including DHCP/static IP configuration
-    Displays clean JSON output without internal object properties
-    Features:
-    - Comprehensive hardware/software inventory
-    - Detailed network configuration
-    - Custom JSON formatting
-    - Asset number validation
+    Output matches the structure of SystemInfoCollector.ps1
 .NOTES
     Author: Lesedi Sebekedi
-    Version: 1.0
+    Version: 1.1
     Last Updated: $(Get-Date -Format "yyyy-MM-dd")
 #>
 
@@ -34,65 +29,14 @@ function Convert-WmiDateTime {
     param([string]$wmiDate)
     
     if ([string]::IsNullOrEmpty($wmiDate)) { 
-        return "N/A" 
+        return $null
     }
     
     try {
         return [Management.ManagementDateTimeConverter]::ToDateTime($wmiDate).ToString('yyyy-MM-dd HH:mm:ss')
     } 
     catch {
-        return "InvalidDate"
-    }
-}
-
-<#
-.SYNOPSIS
-    Formats output as pretty JSON with custom indentation
-.PARAMETER InputObject
-    The object to format as JSON
-.PARAMETER Indent
-    Current indentation level (used for recursion)
-#>
-function Format-JsonOutput {
-    param(
-        $InputObject,
-        [int]$Indent = 0
-    )
-    
-    $indentSpace = " " * $Indent
-    $nextIndent = $Indent + 2
-
-    switch ($InputObject) {
-        { $_ -is [System.Collections.IDictionary] } {
-            $items = @()
-            foreach ($key in $InputObject.Keys) {
-                $val = Format-JsonOutput -InputObject $InputObject[$key] -Indent $nextIndent
-                $items += "$([string]::Format('"{0}" : {1}', $key, $val))"
-            }
-            return "{`n$($indentSpace + '  ' + ($items -join ",`n$indentSpace  "))`n$indentSpace}"
-        }
-        
-        { $_ -is [System.Collections.IEnumerable] -and -not ($_ -is [string]) } {
-            $items = $_ | ForEach-Object { Format-JsonOutput -InputObject $_ -Indent $nextIndent }
-            return "[`n$($indentSpace + '  ' + ($items -join ",`n$indentSpace  "))`n$indentSpace]"
-        }
-        
-        { $_ -is [string] } {
-            $escaped = $_.Replace('"', '\"')
-            return '"' + $escaped + '"'
-        }
-        
-        { $_ -is [bool] } {
-            return $_.ToString().ToLower()
-        }
-        
-        { $null -eq $_ } {
-            return "null"
-        }
-        
-        default {
-            return $_.ToString()
-        }
+        return $null
     }
 }
 #endregion
@@ -110,28 +54,18 @@ function Get-NetworkConfiguration {
         $nics = Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled }
 
         foreach ($nic in $nics) {
-            # Determine IP configuration type
-            $ipConfigType = if ($nic.DHCPEnabled) { "DHCP" } else { "Static" }
-
-            # Collect DHCP lease information if applicable
-            $leaseInfo = @{}
-            if ($nic.DHCPEnabled) {
-                $leaseInfo = @{
-                    DHCPServer    = $nic.DHCPServer
-                    LeaseObtained = Convert-WmiDateTime $nic.DHCPLeaseObtained
-                    LeaseExpires  = Convert-WmiDateTime $nic.DHCPLeaseExpires
-                }
-            }
-
             $adapters += [PSCustomObject]@{
-                AdapterName     = $nic.Description
-                IPConfiguration = $ipConfigType
-                IPAddress       = if ($nic.IPAddress) { $nic.IPAddress } else { @() }
-                SubnetMask      = if ($nic.IPSubnet) { $nic.IPSubnet } else { @() }
-                DefaultGateway  = if ($nic.DefaultIPGateway) { $nic.DefaultIPGateway } else { @() }
-                DNSServers      = if ($nic.DNSServerSearchOrder) { $nic.DNSServerSearchOrder } else { @() }
-                MACAddress      = $nic.MACAddress
-                DHCPInfo       = $leaseInfo
+                Name = $nic.Description
+                InterfaceDescription = $nic.Description
+                MacAddress = $nic.MACAddress
+                Speed = if ($nic.Speed) { "$($nic.Speed / 1MB) Mbps" } else { "N/A" }
+                IPAddress = if ($nic.IPAddress) { $nic.IPAddress[0] } else { $null }
+                IPConfiguration = if ($nic.DHCPEnabled) { "DHCP" } else { "Static" }
+                DHCPServer = if ($nic.DHCPEnabled) { $nic.DHCPServer } else { $null }
+                LeaseObtained = if ($nic.DHCPEnabled) { Convert-WmiDateTime $nic.DHCPLeaseObtained } else { $null }
+                LeaseExpires = if ($nic.DHCPEnabled) { Convert-WmiDateTime $nic.DHCPLeaseExpires } else { $null }
+                DefaultGateway = if ($nic.DefaultIPGateway) { $nic.DefaultIPGateway[0] } else { $null }
+                DNSServers = if ($nic.DNSServerSearchOrder) { $nic.DNSServerSearchOrder } else { $null }
             }
         }
 
@@ -139,7 +73,7 @@ function Get-NetworkConfiguration {
     } 
     catch {
         Write-Warning "Error collecting network information: $_"
-        return $null
+        return @()
     }
 }
 
@@ -155,20 +89,28 @@ function Get-Win7SystemInfo {
         $os = Get-WmiObject Win32_OperatingSystem
         $computer = Get-WmiObject Win32_ComputerSystem
         $bios = Get-WmiObject Win32_BIOS
+        $product = Get-WmiObject Win32_ComputerSystemProduct
         #endregion
 
         #region Hardware Information
         $cpu = Get-WmiObject Win32_Processor | Select-Object -First 1
         $memory = Get-WmiObject Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum
-        $disks = Get-WmiObject Win32_LogicalDisk | Where-Object { $_.DriveType -eq 3 }
+        $pageFile = Get-WmiObject Win32_PageFileUsage | Select-Object @{Name="PageFileGB"; Expression={[math]::Round($_.AllocatedBaseSize / 1KB, 2)}}
+        $disks = Get-WmiObject Win32_LogicalDisk | Where-Object { $_.DriveType -eq 3 } | Select-Object DeviceID, VolumeName,
+            @{Name="SizeGB"; Expression={[math]::Round($_.Size / 1GB, 2)}},
+            @{Name="FreeGB"; Expression={[math]::Round($_.FreeSpace / 1GB, 2)}},
+            @{Name="Type"; Expression={"Fixed"}}
+        $gpu = Get-WmiObject Win32_VideoController | Select-Object Name,
+            @{Name="AdapterRAMGB"; Expression={[math]::Round($_.AdapterRAM / 1GB, 2)}},
+            DriverVersion
         #endregion
 
         #region Network Information
-        $network = Get-NetworkConfiguration
+        $networkAdapters = Get-NetworkConfiguration
         #endregion
 
         #region Installed Software
-        $software = @()
+        $installedApps = @()
         $regPaths = @(
             "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
             "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
@@ -176,53 +118,57 @@ function Get-Win7SystemInfo {
         
         foreach ($path in $regPaths) {
             if (Test-Path $path) {
-                $apps = Get-ItemProperty $path | Where-Object { $_.DisplayName }
-                foreach ($app in $apps) {
-                    $software += [PSCustomObject]@{
-                        Name      = $app.DisplayName
-                        Version   = if ($app.DisplayVersion) { $app.DisplayVersion } else { "N/A" }
-                        Publisher = if ($app.Publisher) { $app.Publisher } else { "N/A" }
-                    }
-                }
+                $apps = Get-ItemProperty $path | Where-Object { $_.DisplayName -and -not $_.SystemComponent }
+                $installedApps += $apps | Select-Object DisplayName, DisplayVersion, Publisher, InstallDate
             }
+        }
+        #endregion
+
+        #region Hotfixes
+        $hotfixes = @()
+        if (Get-Command Get-HotFix -ErrorAction SilentlyContinue) {
+            $hotfixes = Get-HotFix -ErrorAction SilentlyContinue | Select-Object HotFixID, Description, InstalledOn
         }
         #endregion
 
         #region Build Output Object
         $result = [PSCustomObject]@{
-            System = [PSCustomObject]@{
-                HostName      = $env:COMPUTERNAME
+            System = @{
+                HostName     = $env:COMPUTERNAME
                 OS           = $os.Caption
-                Version       = $os.Version
-                Architecture  = if ([IntPtr]::Size -eq 8) { "64-bit" } else { "32-bit" }
-                Manufacturer  = $computer.Manufacturer
-                Model         = $computer.Model
-                BIOS          = [PSCustomObject]@{
+                Version      = $os.Version
+                Build        = $os.BuildNumber
+                Architecture = if ([IntPtr]::Size -eq 8) { "64-bit" } else { "32-bit" }
+                BootTime     = Convert-WmiDateTime $os.LastBootUpTime
+                Manufacturer = $computer.Manufacturer
+                Model        = $computer.Model
+                BIOS         = @{
+                    Serial = $bios.SerialNumber
                     Version = $bios.SMBIOSBIOSVersion
-                    Serial  = $bios.SerialNumber
                 }
             }
-            Hardware = [PSCustomObject]@{
-                CPU = [PSCustomObject]@{
-                    Name       = $cpu.Name
-                    Cores      = $cpu.NumberOfCores
-                    Threads    = $cpu.NumberOfLogicalProcessors
+            Hardware = @{
+                CPU    = [PSCustomObject]@{
+                    Name = $cpu.Name
+                    Cores = $cpu.NumberOfCores
+                    Threads = $cpu.NumberOfLogicalProcessors
                     ClockSpeed = "$($cpu.MaxClockSpeed) MHz"
                 }
-                Memory = [PSCustomObject]@{
-                    TotalGB = [math]::Round($memory.Sum / 1GB, 2)
+                Memory = @{
+                    TotalGB    = [math]::Round($memory.Sum / 1GB, 2)
+                    Sticks     = $memory.Count
+                    PageFileGB = if ($pageFile) { $pageFile.PageFileGB } else { 0 }
                 }
-                Disks = $disks | ForEach-Object {
-                    [PSCustomObject]@{
-                        Drive  = $_.DeviceID
-                        SizeGB = if ($_.Size) { [math]::Round($_.Size / 1GB, 2) } else { 0 }
-                        FreeGB = if ($_.FreeSpace) { [math]::Round($_.FreeSpace / 1GB, 2) } else { 0 }
-                    }
-                }
+                Disks  = $disks
+                GPU    = $gpu
             }
-            NetworkAdapters = $network
-            Software        = $software
-            Timestamp       = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            Network = if ($networkAdapters.Count -eq 1) { $networkAdapters[0] } else { $networkAdapters }
+            Software = @{
+                InstalledApps = $installedApps
+                Hotfixes     = $hotfixes
+            }
+            UUID    = $product.UUID
+            PSVersion = $PSVersionTable.PSVersion.ToString()
         }
         #endregion
 
@@ -236,10 +182,6 @@ function Get-Win7SystemInfo {
 #endregion
 
 #region Main Execution
-# Display header
-Write-Host "Windows 7 System Information Collector" -ForegroundColor Cyan
-Write-Host "------------------------------------" -ForegroundColor Cyan
-
 # Asset number input with validation (11 digits starting with 0)
 do {
     $assetNumber = Read-Host "Enter Asset Number (11 digits starting with 0)"
@@ -250,36 +192,64 @@ $systemInfo = Get-Win7SystemInfo
 
 if ($systemInfo) {
     # Add asset number to collected data
-    $systemInfo | Add-Member -NotePropertyName AssetNumber -NotePropertyValue $assetNumber
+    $systemInfo | Add-Member -NotePropertyName "AssetNumber" -NotePropertyValue $assetNumber -Force
 
-    # Format and display JSON output
-    $jsonOutput = Format-JsonOutput $systemInfo
-    Write-Host "`nSystem Information (JSON Format):`n" -ForegroundColor Green
-    Write-Host $jsonOutput
+    # Create output directory if it doesn't exist
+    $outputDir = "$env:USERPROFILE\Desktop\SystemReports"
+    if (-not (Test-Path $outputDir)) { 
+        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null 
+    }
 
-    # Save to file option
-    $saveToFile = Read-Host "`nSave to file? (Y/N)"
-    if ($saveToFile -match '^[Yy]$') {
-        $outputDir = "$env:USERPROFILE\Desktop\SystemReports"
+    # Generate output filename with sanitized computer name and timestamp
+    $computerName = $env:COMPUTERNAME -replace '[\\/:*?"<>|]', '_'
+    $reportPath = "$outputDir\$computerName-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
+
+    # Export data to JSON file
+    #region JSON Conversion (PS 2.0 Compatible)
+    function ConvertTo-JsonFallback {
+        param($InputObject, [int]$Depth = 5)
         
-        try {
-            # Create output directory if it doesn't exist
-            if (-not (Test-Path $outputDir)) {
-                New-Item -ItemType Directory -Path $outputDir -ErrorAction Stop | Out-Null
+        if ($PSVersionTable.PSVersion.Major -ge 3) {
+            # Use native ConvertTo-Json if available (PS 3.0+)
+            return $InputObject | ConvertTo-Json -Depth $Depth
+        }
+        else {
+            # Fallback to custom formatter (simplified version of your original)
+            function Format-JsonInner($obj, $indent = 0) {
+                $space = " " * $indent
+                if ($obj -is [System.Collections.IDictionary]) {
+                    $entries = @()
+                    foreach ($key in $obj.Keys) {
+                        $entries += "$space`"$key`": $(Format-JsonInner $obj[$key] ($indent + 2))"
+                    }
+                    return "{`n" + ($entries -join ",`n") + "`n$space}"
+                }
+                elseif ($obj -is [Array]) {
+                    $entries = $obj | ForEach-Object { Format-JsonInner $_ ($indent + 2) }
+                    return "[`n" + ($entries -join ",`n") + "`n$space]"
+                }
+                elseif ($obj -is [string]) {
+                    return '"' + $obj.Replace('"', '\"') + '"'
+                }
+                elseif ($null -eq $obj) {
+                    return 'null'
+                }
+                else {
+                    return $obj.ToString()
+                }
             }
-            
-            # Generate filename with computer name and timestamp
-            $timestampSafe = (Get-Date).ToString('yyyyMMdd_HHmmss')
-            $outputFile = Join-Path $outputDir "$($env:COMPUTERNAME)_SystemInfo_$timestampSafe.json"
-            
-            # Save JSON to file
-            $jsonOutput | Out-File -FilePath $outputFile -Encoding UTF8 -Force
-            Write-Host "`nSaved to: $outputFile" -ForegroundColor Green
-        } 
-        catch {
-            Write-Warning "Failed to save file: $_"
+            return Format-JsonInner $InputObject
         }
     }
+    #endregion
+
+    # Replace this line in Main Execution:
+    # $systemInfo | ConvertTo-Json -Depth 5 | Out-File ...
+    # With:
+    ConvertTo-JsonFallback -InputObject $systemInfo -Depth 5 | Out-File $reportPath -Force
+
+    # Provide user feedback
+    Write-Host "System information successfully saved to:`n$reportPath" -ForegroundColor Green
 } 
 else {
     Write-Host "Failed to collect system information" -ForegroundColor Red
