@@ -301,7 +301,9 @@ function Show-SystemDetails {
             n.MacAddress,
             n.SubnetMask,
             n.DefaultGateway,
-            n.DNSServers
+            n.DNSServers,
+            n.DHCPServer,
+            n.IPConfigType
         FROM Systems s
         LEFT JOIN Hardware h ON s.AssetNumber = h.AssetNumber
         LEFT JOIN Network n ON s.AssetNumber = n.AssetNumber
@@ -633,8 +635,10 @@ function Show-SystemDetails {
                                     $(Render-DetailRow "IP Address" $details["IPAddress"])
                                     $(Render-DetailRow "MAC Address" $details["MacAddress"])
                                     $(Render-DetailRow "Subnet Mask" $details["SubnetMask"])
-                                    $(Render-DetailRow "Default Gateway" $details["DefaultGateway"])
                                     $(Render-DetailRow "DNS Servers" $details["DNSServers"])
+                                    $(Render-DetailRow "Default Gateway" $details["DefaultGateway"])
+                                    $(Render-DetailRow "DHCP Server" $details["DHCPServer"])
+                                    $(Render-DetailRow "IP Config Type" $details["IPConfigType"])
                                 </table>
                             </div>
                         </div>
