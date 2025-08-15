@@ -234,7 +234,7 @@ $systemInfo = Get-Win7SystemInfo
 
 if ($systemInfo -ne $null) {
     # Add asset number property
-    $systemInfo | Add-Member -NotePropertyName "AssetNumber" -NotePropertyValue $assetNumber -Force
+    $systemInfo | Add-Member -MemberType NoteProperty -Name "AssetNumber" -Value $assetNumber -Force
 
     # Create output directory
     $outputDir = "$env:USERPROFILE\Desktop\SystemReports"
