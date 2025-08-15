@@ -26,6 +26,13 @@ Get-ChildItem -Path $FolderPath -Filter *.txt | ForEach-Object {
 
     $textContent = Get-Content -Path $_.FullName -Raw
 
+    # Extract memory sticks count from the text
+    $memorySticks = if ($textContent -match "Memory: \d+ GB \((\d+) sticks\)") {
+        [int]$matches[1]
+    } else {
+        0
+    }
+
     # Build PTJSEBOLA-style object
     $output = @{
         System = @{
@@ -42,94 +49,100 @@ Get-ChildItem -Path $FolderPath -Filter *.txt | ForEach-Object {
             BootTime     = ($textContent -match "Last Boot: (.+?)\r?\n") ? $matches[1].Trim() : $null
             Build        = ($textContent -match "Build: (.+?)\r?\n") ? $matches[1].Trim() : $null
         }
-
         Hardware = @{
             GPU = @{
                 Name         = ($textContent -match "GPU: (.+?)\r?\n") ? $matches[1].Trim() : $null
-                AdapterRAMGB = ($textContent -match "GPU RAM: (.+?) GB") ? [decimal]$matches[1].Trim() : $null
-                DriverVersion= ($textContent -match "GPU Driver: (.+?)\r?\n") ? $matches[1].Trim() : $null
+                AdapterRAMGB = ($textContent -match "VRAM: (.+?) GB") ? [decimal]$matches[1].Trim() : $null
+                DriverVersion= ($textContent -match "Driver: (.+?)\r?\n") ? $matches[1].Trim() : $null
             }
             CPU = @{
                 Name       = ($textContent -match "CPU: (.+?)\r?\n") ? $matches[1].Trim() : $null
-                Cores      = ($textContent -match "Cores: (.+?)\r?\n") ? [int]$matches[1].Trim() : $null
-                Threads    = ($textContent -match "Threads: (.+?)\r?\n") ? [int]$matches[1].Trim() : $null
+                Cores      = ($textContent -match "Cores: (\d+)\r?\n") ? [int]$matches[1].Trim() : $null
+                Threads    = ($textContent -match "Threads: (\d+)\r?\n") ? [int]$matches[1].Trim() : $null
                 ClockSpeed = ($textContent -match "Clock Speed: (.+?)\r?\n") ? $matches[1].Trim() : $null
             }
             Memory = @{
-                TotalGB   = ($textContent -match "Memory: (.+?) GB") ? [int]$matches[1].Trim() : $null
+                TotalGB   = ($textContent -match "Memory: (.+?) GB") ? [decimal]$matches[1].Trim() : $null
                 PageFileGB= ($textContent -match "Page File: (.+?) GB") ? [decimal]$matches[1].Trim() : $null
-                Sticks    = ($textContent -match "Memory Sticks: (.+?)\r?\n") ? [int]$matches[1].Trim() : $null
+                Sticks    = $memorySticks
             }
-            Disks = @{
-                DeviceID   = "C:"
-                VolumeName = ($textContent -match "Disk C: Label: (.+?)\r?\n") ? $matches[1].Trim() : $null
-                SizeGB     = ($textContent -match "Disk C: Size: (.+?) GB") ? [decimal]$matches[1].Trim() : $null
-                FreeGB     = ($textContent -match "Disk C: Free: (.+?) GB") ? [decimal]$matches[1].Trim() : $null
-                Type       = "Fixed"
-                ExtraDisks = @() # Will store any other disks
-            }
+            Disks = @()
         }
-
         Network = @()
         Software = @{
             Hotfixes = @()
             InstalledApps = @()
         }
-
         UUID      = ($textContent -match "UUID: (.+?)\r?\n") ? $matches[1].Trim() : $null
-        PSVersion = ($textContent -match "PSVersion: (.+?)\r?\n") ? $matches[1].Trim() : $null
-        AssetNumber = ($textContent -match "Asset Number: (.+?)\r?\n") ? $matches[1].Trim() : $null
+        PSVersion = ($textContent -match "Report generated with PowerShell (.+?)\r?\n") ? $matches[1].Trim() : $null
+        AssetNumber = ($textContent -match "ASSET NUMBER: (.+?)\r?\n") ? $matches[1].Trim() : $null
     }
 
-    # Extra disks
-    $diskMatches = [regex]::Matches($textContent, "Disk ([A-Z]): Size: (.+?) GB, Free: (.+?) GB")
-    foreach ($m in $diskMatches) {
-        if ($m.Groups[1].Value -ne "C") {
-            $output.Hardware.Disks.ExtraDisks += @{
-                DeviceID = "$($m.Groups[1].Value):"
-                SizeGB   = [decimal]$m.Groups[2].Value
-                FreeGB   = [decimal]$m.Groups[3].Value
-                Type     = "Fixed"
+    # Parse disks
+    $diskMatches = [regex]::Matches($textContent, "Drive (.+?): (.+?)GB total, (.+?)GB free \((.+?)\)")
+    foreach ($disk in $diskMatches) {
+        $output.Hardware.Disks += @{
+            DeviceID = $disk.Groups[1].Value.Trim()
+            SizeGB = [decimal]$disk.Groups[2].Value.Trim()
+            FreeGB = [decimal]$disk.Groups[3].Value.Trim()
+            VolumeName = $disk.Groups[4].Value.Trim()
+            Type = "Fixed"
+        }
+    }
+
+    # Parse network adapters
+    $networkSection = [regex]::Match($textContent, "--- NETWORK ---(.+?)--- SOFTWARE ---", [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    if ($networkSection.Success) {
+        $networkContent = $networkSection.Groups[1].Value
+        $adapterBlocks = $networkContent -split "\r?\n\r?\n" | Where-Object { $_ -match "Adapter:" }
+
+        foreach ($block in $adapterBlocks) {
+            $adapter = @{
+                Name = ($block -match "Adapter: (.+?)\r?\n") ? $matches[1].Trim() : $null
+                IPAddress = ($block -match "IPAddress: (.+?)\r?\n") ? $matches[1].Trim() : $null
+                SubnetMask = ($block -match "SubnetMask: (.+?)\r?\n") ? $matches[1].Trim() : $null
+                DefaultGateway = ($block -match "DefaultGateway: (.+?)\r?\n") ? $matches[1].Trim() : $null
+                MacAddress = ($block -match "MacAddress: (.+?)\r?\n") ? $matches[1].Trim() : $null
+                DNSServers = ($block -match "DNSServer: (.+?)\r?\n") ? $matches[1].Trim() : $null
+                Speed = "N/A" # Not present in the text file
             }
+            $output.Network += $adapter
         }
     }
 
-    # Network parsing (always array)
-    $nicMatches = [regex]::Matches($textContent, "NIC: (.+?)\r?\nMAC: (.+?)\r?\nIP: (.+?)\r?\n")
-    foreach ($n in $nicMatches) {
-        $output.Network += @{
-            Name = $n.Groups[1].Value.Trim()
-            MacAddress = $n.Groups[2].Value.Trim()
-            IPAddress = $n.Groups[3].Value.Trim()
-        }
-    }
-
-    # Installed apps
-    $appMatches = [regex]::Matches($textContent, "App: (.+?) \| Version: (.*?) \| Publisher: (.*?) \| Date: (.*?)\r?\n")
-    foreach ($a in $appMatches) {
+    # Parse installed applications
+    $appMatches = [regex]::Matches($textContent, "  (.+?) \((.+?)\) by (.+?)\r?\n")
+    foreach ($app in $appMatches) {
         $output.Software.InstalledApps += @{
-            DisplayName    = $a.Groups[1].Value.Trim()
-            DisplayVersion = $a.Groups[2].Value.Trim()
-            Publisher      = $a.Groups[3].Value.Trim()
-            InstallDate    = $a.Groups[4].Value.Trim()
+            DisplayName = $app.Groups[1].Value.Trim()
+            DisplayVersion = $app.Groups[2].Value.Trim()
+            Publisher = $app.Groups[3].Value.Trim()
+            InstallDate = $null
         }
     }
 
-    # Hotfixes
-    $hotfixMatches = [regex]::Matches($textContent, "Hotfix: (.+?) \| Desc: (.+?) \| Date: (.*?)\r?\n")
-    foreach ($h in $hotfixMatches) {
-        $dateStr = $h.Groups[3].Value.Trim()
+    # Parse hotfixes (PowerShell 2.0 compatible version)
+    $hotfixMatches = [regex]::Matches($textContent, "  (.+?) - (.+?) \(Installed: (.+?)\)\r?\n")
+    foreach ($hotfix in $hotfixMatches) {
+        $dateStr = $hotfix.Groups[3].Value.Trim()
         $dateObj = $null
-        $dateMs  = $null
-        if ([DateTime]::TryParse($dateStr, [ref]$dateObj)) {
+        $dateMs = $null
+        
+        # PowerShell 2.0 compatible date parsing
+        try {
+            $dateObj = [DateTime]::Parse($dateStr)
             $dateMs = [int][double]::Parse((Get-Date $dateObj -UFormat %s)) * 1000
         }
+        catch {
+            $dateObj = $null
+        }
+        
         $output.Software.Hotfixes += @{
-            HotFixID = $h.Groups[1].Value.Trim()
-            Description = $h.Groups[2].Value.Trim()
+            HotFixID = $hotfix.Groups[1].Value.Trim()
+            Description = $hotfix.Groups[2].Value.Trim()
             InstalledOn = @{
                 value = if ($dateMs) { "/Date($dateMs)/" } else { $null }
-                DateTime = if ($dateObj) { $dateObj.ToString("dddd, dd MMMM yyyy HH:mm:ss") } else { "N/A" }
+                DateTime = if ($dateObj) { $dateObj.ToString("yyyy-MM-dd HH:mm:ss") } else { $dateStr }
             }
         }
     }
