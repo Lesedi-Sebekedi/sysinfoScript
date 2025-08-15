@@ -1,15 +1,15 @@
 <#
 .SYNOPSIS
-    Imports system inventory data from JSON files to SQL Server
+    Imports system inventory data from JSON files to SQL Server using the new schema
 .DESCRIPTION
-    Processes JSON inventory files and imports them into a SQL database
-    Handles both new systems and updates to existing records
+    Processes JSON inventory files and imports them into a SQL database.
+    Handles both new systems and updates to existing records.
 .COMPANY
     North West Provincial Treasury
 .AUTHOR
     Lesedi Sebekedi
 .VERSION
-    2.0
+    4.0
 .SECURITY
     Requires SQL write permissions to the AssetDB database
 .PARAMETER ReportsFolder
@@ -23,73 +23,174 @@ param(
     [string]$ConnectionString = "Server=PTLSEBEKEDI;Database=AssetDB;Integrated Security=True"
 )
 
-# Load required assembly for SQL operations
-Add-Type -AssemblyName "System.Data"
+#region Helper Functions
+
+function Safe-AddSqlParameter {
+    <#
+    .SYNOPSIS
+        Safely adds a parameter to a SQL command with proper null handling and optional size/precision.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Data.SqlClient.SqlCommand]$Command,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter()][object]$Value,
+        [Parameter(Mandatory)][System.Data.SqlDbType]$Type,
+        [int]$Size = 0,
+        [int]$Precision = 0,
+        [int]$Scale = 0
+    )
+
+    # Create parameter with or without size
+    $param = if ($Size -gt 0) {
+        $Command.Parameters.Add($Name, $Type, $Size)
+    } else {
+        $Command.Parameters.Add($Name, $Type)
+    }
+
+    # Apply numeric precision/scale for decimals
+    if ($Type -eq [System.Data.SqlDbType]::Decimal -and $Precision -gt 0) {
+        $param.Precision = [byte]$Precision
+        $param.Scale     = [byte]$Scale
+    }
+
+    # Normalize value
+    if ($null -eq $Value -or ($Value -is [string] -and [string]::IsNullOrWhiteSpace($Value))) {
+        $param.Value = [DBNull]::Value
+    }
+    elseif ($Value -is [array]) {
+        $param.Value = ($Value -join ', ')
+    }
+    else {
+        # Do NOT blindly ToString() – keep native type for correct SqlDbType
+        $param.Value = $Value
+    }
+}
+
+function Get-FormattedAssetNumber {
+    <#
+    .SYNOPSIS
+        Extracts and formats the asset number from system data.
+    #>
+    param([Parameter(Mandatory)][PSObject]$SystemData)
+
+    $raw = $SystemData.AssetNumber
+    if ($null -ne $raw) {
+        $text = $raw.ToString().Trim()
+        if ($text) { return $text }
+    }
+    throw "Invalid or missing AssetNumber in system data."
+}
+
+function Get-SafeDateTime {
+    <#
+    .SYNOPSIS
+        Best-effort DateTime parser returning [DBNull]::Value on failure.
+    #>
+    param([string]$DateString)
+
+    if ([string]::IsNullOrWhiteSpace($DateString)) { return [DBNull]::Value }
+
+    try {
+        # Try parsing as DateTimeOffset
+        $dto = [DateTimeOffset]::Parse($DateString)
+        return $dto.DateTime
+    } catch {
+        # Fallback to DateTime parse
+        try {
+            $dt = [DateTime]::Parse($DateString)
+            return $dt
+        } catch {
+            return [DBNull]::Value
+        }
+    }
+}
+
+function Get-SafeSqlDateTime {
+    <#
+    .SYNOPSIS
+        Wrapper used by Software import to keep original call sites.
+    #>
+    param([string]$DateString)
+    return (Get-SafeDateTime -DateString $DateString)
+}
+
+#endregion Helper Functions
+
+#region Import Functions
 
 function Import-SystemRecord {
     <#
     .SYNOPSIS
-        Imports a single system record into the database
-    .DESCRIPTION
-        Handles both new system creation and updates to existing systems
-        with full transaction support
+        Inserts or updates a system record in the database.
     #>
     param(
-        [PSObject]$SystemData,
-        [System.Data.SqlClient.SqlConnection]$Connection,
-        [System.Data.SqlClient.SqlTransaction]$Transaction
+        [Parameter(Mandatory)][PSObject]$SystemData,
+        [Parameter(Mandatory)][System.Data.SqlClient.SqlConnection]$Connection,
+        [Parameter(Mandatory)][System.Data.SqlClient.SqlTransaction]$Transaction
     )
-    
     try {
-        # Check if system already exists
-        $checkCmd = $Connection.CreateCommand()
-        $checkCmd.Transaction = $Transaction
-        $checkCmd.CommandText = "SELECT SystemID FROM Systems WHERE AssetNumber=@AssetNumber OR UUID=@UUID"
-        
-        $checkCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@AssetNumber", [System.Data.SqlDbType]::VarChar, 50))).Value = $SystemData.AssetNumber
-        $checkCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@UUID", [System.Data.SqlDbType]::VarChar, 36))).Value = $SystemData.UUID
-        
-        $systemId = $checkCmd.ExecuteScalar()
+        $assetNumber = Get-FormattedAssetNumber -SystemData $SystemData
 
-        if ($systemId) {
-            # Update existing system record
-            $updateCmd = $Connection.CreateCommand()
-            $updateCmd.Transaction = $Transaction
-            $updateCmd.CommandText = @"
-                UPDATE Systems 
-                SET HostName = @HostName, 
-                    SerialNumber = @SerialNumber, 
-                    ScanDate = @ScanDate 
-                WHERE SystemID = @SystemID
+        # Existence check
+        $check = $Connection.CreateCommand()
+        $check.Transaction = $Transaction
+        $check.CommandText = "SELECT 1 FROM Systems WHERE AssetNumber = @AssetNumber"
+        Safe-AddSqlParameter -Command $check -Name "@AssetNumber" -Value $assetNumber -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+        $exists = $null -ne $check.ExecuteScalar()
+
+        $cmd = $Connection.CreateCommand()
+        $cmd.Transaction = $Transaction
+        $cmd.CommandText = if ($exists) {
+@"
+UPDATE Systems
+SET HostName=@HostName,
+    UUID=@UUID,
+    SerialNumber=@SerialNumber,
+    OS=@OS,
+    Version=@Version,
+    Architecture=@Architecture,
+    Build=@Build,
+    Manufacturer=@Manufacturer,
+    Model=@Model,
+    BootTime=@BootTime,
+    BIOSVersion=@BIOSVersion,
+    ScanDate=@ScanDate,
+    PSVersion=@PSVersion
+WHERE AssetNumber=@AssetNumber
 "@
-            
-            $updateCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@HostName", [System.Data.SqlDbType]::VarChar, 100))).Value = $SystemData.System.HostName
-            $updateCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@SerialNumber", [System.Data.SqlDbType]::VarChar, 100))).Value = $SystemData.System.BIOS.Serial
-            $updateCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@ScanDate", [System.Data.SqlDbType]::DateTime))).Value = [DateTime]::Now
-            $updateCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@SystemID", [System.Data.SqlDbType]::Int))).Value = $systemId
-            
-            $updateCmd.ExecuteNonQuery() | Out-Null
-        }
-        else {
-            # Insert new system record
-            $insertCmd = $Connection.CreateCommand()
-            $insertCmd.Transaction = $Transaction
-            $insertCmd.CommandText = @"
-                INSERT INTO Systems (AssetNumber, HostName, UUID, SerialNumber, ScanDate)
-                VALUES (@AssetNumber, @HostName, @UUID, @SerialNumber, @ScanDate);
-                SELECT SCOPE_IDENTITY();
+        } else {
+@"
+INSERT INTO Systems (
+    AssetNumber, HostName, UUID, SerialNumber, OS, Version,
+    Architecture, Build, Manufacturer, Model, BootTime,
+    BIOSVersion, ScanDate, PSVersion
+)
+VALUES (
+    @AssetNumber, @HostName, @UUID, @SerialNumber, @OS, @Version,
+    @Architecture, @Build, @Manufacturer, @Model, @BootTime,
+    @BIOSVersion, @ScanDate, @PSVersion
+)
 "@
-            
-            $insertCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@AssetNumber", [System.Data.SqlDbType]::VarChar, 50))).Value = $SystemData.AssetNumber
-            $insertCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@HostName", [System.Data.SqlDbType]::VarChar, 100))).Value = $SystemData.System.HostName
-            $insertCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@UUID", [System.Data.SqlDbType]::VarChar, 36))).Value = $SystemData.UUID
-            $insertCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@SerialNumber", [System.Data.SqlDbType]::VarChar, 100))).Value = $SystemData.System.BIOS.Serial
-            $insertCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@ScanDate", [System.Data.SqlDbType]::DateTime))).Value = [DateTime]::Now
-            
-            $systemId = [int]$insertCmd.ExecuteScalar()
         }
 
-        return $systemId
+        # Parameters
+        Safe-AddSqlParameter -Command $cmd -Name "@AssetNumber"  -Value $assetNumber                         -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+        Safe-AddSqlParameter -Command $cmd -Name "@HostName"     -Value $SystemData.System.HostName          -Type ([System.Data.SqlDbType]::VarChar) -Size 100
+        Safe-AddSqlParameter -Command $cmd -Name "@UUID"         -Value $SystemData.UUID                     -Type ([System.Data.SqlDbType]::VarChar) -Size 36
+        Safe-AddSqlParameter -Command $cmd -Name "@SerialNumber" -Value $SystemData.System.BIOS.Serial       -Type ([System.Data.SqlDbType]::VarChar) -Size 100
+        Safe-AddSqlParameter -Command $cmd -Name "@OS"           -Value $SystemData.System.OS                -Type ([System.Data.SqlDbType]::VarChar) -Size 100
+        Safe-AddSqlParameter -Command $cmd -Name "@Version"      -Value $SystemData.System.Version           -Type ([System.Data.SqlDbType]::VarChar) -Size 100
+        Safe-AddSqlParameter -Command $cmd -Name "@Architecture" -Value $SystemData.System.Architecture      -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+        Safe-AddSqlParameter -Command $cmd -Name "@Build"        -Value $SystemData.System.Build             -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+        Safe-AddSqlParameter -Command $cmd -Name "@Manufacturer" -Value $SystemData.System.Manufacturer      -Type ([System.Data.SqlDbType]::VarChar) -Size 100
+        Safe-AddSqlParameter -Command $cmd -Name "@Model"        -Value $SystemData.System.Model             -Type ([System.Data.SqlDbType]::VarChar) -Size 100
+        Safe-AddSqlParameter -Command $cmd -Name "@BootTime"     -Value (Get-SafeDateTime $SystemData.System.BootTime) -Type ([System.Data.SqlDbType]::DateTime)
+        Safe-AddSqlParameter -Command $cmd -Name "@BIOSVersion"  -Value $SystemData.System.BIOS.Version      -Type ([System.Data.SqlDbType]::VarChar) -Size 100
+        Safe-AddSqlParameter -Command $cmd -Name "@ScanDate"     -Value ([DateTime]::UtcNow)                 -Type ([System.Data.SqlDbType]::DateTime)
+        Safe-AddSqlParameter -Command $cmd -Name "@PSVersion"    -Value $SystemData.PSVersion                -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+
+        $cmd.ExecuteNonQuery() | Out-Null
+        return $assetNumber
     }
     catch {
         Write-Error "Failed to import system record: $_"
@@ -97,59 +198,86 @@ function Import-SystemRecord {
     }
 }
 
-function Import-SystemSpecs {
+function Import-Hardware {
     <#
     .SYNOPSIS
-        Imports system specifications into the database
+        Imports hardware info into the database.
     #>
     param(
-        [int]$SystemId,
-        [PSObject]$SystemData,
-        [System.Data.SqlClient.SqlConnection]$Connection,
-        [System.Data.SqlClient.SqlTransaction]$Transaction
+        [Parameter(Mandatory)][string]$AssetNumber,
+        [Parameter(Mandatory)][PSObject]$SystemData,
+        [Parameter(Mandatory)][System.Data.SqlClient.SqlConnection]$Connection,
+        [Parameter(Mandatory)][System.Data.SqlClient.SqlTransaction]$Transaction
     )
-    
     try {
-        $specCmd = $Connection.CreateCommand()
-        $specCmd.Transaction = $Transaction
-        $specCmd.CommandText = @"
-            INSERT INTO SystemSpecs (
-                SystemID, OSName, OSVersion, OSBuild, Architecture,
-                LastBoot, Manufacturer, Model, BIOSVersion,
-                CPUCores, CPUThreads, CPUClockSpeed, TotalRAMGB
-            )
-            VALUES (
-                @SystemID, @OSName, @OSVersion, @OSBuild, @Architecture,
-                @LastBoot, @Manufacturer, @Model, @BIOSVersion,
-                @CPUCores, @CPUThreads, @CPUClockSpeed, @TotalRAMGB
-            )
+        # Check existing hardware
+        $check = $Connection.CreateCommand()
+        $check.Transaction = $Transaction
+        $check.CommandText = "SELECT HardwareID FROM Hardware WHERE AssetNumber = @AssetNumber"
+        Safe-AddSqlParameter -Command $check -Name "@AssetNumber" -Value $AssetNumber -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+        $hardwareId = $check.ExecuteScalar()
+
+        $cmd = $Connection.CreateCommand()
+        $cmd.Transaction = $Transaction
+        $cmd.CommandText = if ($hardwareId) {
+@"
+UPDATE Hardware SET
+    CPUName=@CPUName,
+    CPUCores=@CPUCores,
+    CPUThreads=@CPUThreads,
+    CPUClockSpeed=@CPUClockSpeed,
+    TotalRAMGB=@TotalRAMGB,
+    PageFileGB=@PageFileGB,
+    MemorySticks=@MemorySticks,
+    GPUName=@GPUName,
+    GPUAdapterRAMGB=@GPUAdapterRAMGB,
+    GPUDriverVersion=@GPUDriverVersion
+WHERE AssetNumber=@AssetNumber
 "@
+        } else {
+@"
+INSERT INTO Hardware (
+    AssetNumber, CPUName, CPUCores, CPUThreads, CPUClockSpeed,
+    TotalRAMGB, PageFileGB, MemorySticks, GPUName, GPUAdapterRAMGB, GPUDriverVersion
+) VALUES (
+    @AssetNumber, @CPUName, @CPUCores, @CPUThreads, @CPUClockSpeed,
+    @TotalRAMGB, @PageFileGB, @MemorySticks, @GPUName, @GPUAdapterRAMGB, @GPUDriverVersion
+)
+"@
+        }
 
-        # Add all parameters with proper data types
-        $specCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@SystemID", [System.Data.SqlDbType]::Int))).Value = $SystemId
-        $specCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@OSName", [System.Data.SqlDbType]::VarChar, 100))).Value = $SystemData.System.OS
-        $specCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@OSVersion", [System.Data.SqlDbType]::VarChar, 50))).Value = $SystemData.System.Version
-        $specCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@OSBuild", [System.Data.SqlDbType]::VarChar, 20))).Value = $SystemData.System.Build
-        $specCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@Architecture", [System.Data.SqlDbType]::VarChar, 10))).Value = $SystemData.System.Architecture
-        $specCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@LastBoot", [System.Data.SqlDbType]::DateTime))).Value = [DateTime]::ParseExact($SystemData.System.BootTime, 'yyyy-MM-dd HH:mm:ss', $null)
-        $specCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@Manufacturer", [System.Data.SqlDbType]::VarChar, 100))).Value = $SystemData.System.Manufacturer
-        $specCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@Model", [System.Data.SqlDbType]::VarChar, 100))).Value = $SystemData.System.Model
-        $specCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@BIOSVersion", [System.Data.SqlDbType]::VarChar, 100))).Value = $SystemData.System.BIOS.Version
-        $specCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@CPUCores", [System.Data.SqlDbType]::Int))).Value = $SystemData.Hardware.CPU.Cores
-        $specCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@CPUThreads", [System.Data.SqlDbType]::Int))).Value = $SystemData.Hardware.CPU.Threads
-        $specCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@CPUClockSpeed", [System.Data.SqlDbType]::VarChar, 20))).Value = $SystemData.Hardware.CPU.ClockSpeed
-        
-        # Special handling for decimal parameter
-        $ramParam = New-Object System.Data.SqlClient.SqlParameter("@TotalRAMGB", [System.Data.SqlDbType]::Decimal)
-        $ramParam.Precision = 5
-        $ramParam.Scale = 2
-        $ramParam.Value = $SystemData.Hardware.Memory.TotalGB
-        $specCmd.Parameters.Add($ramParam)
+        # Parameters
+        Safe-AddSqlParameter -Command $cmd -Name "@AssetNumber"       -Value $AssetNumber                              -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+        Safe-AddSqlParameter -Command $cmd -Name "@CPUName"           -Value $SystemData.Hardware.CPU.Name            -Type ([System.Data.SqlDbType]::VarChar) -Size 100
+        Safe-AddSqlParameter -Command $cmd -Name "@CPUCores"          -Value $SystemData.Hardware.CPU.Cores           -Type ([System.Data.SqlDbType]::Int)
+        Safe-AddSqlParameter -Command $cmd -Name "@CPUThreads"        -Value $SystemData.Hardware.CPU.Threads         -Type ([System.Data.SqlDbType]::Int)
+        Safe-AddSqlParameter -Command $cmd -Name "@CPUClockSpeed"     -Value $SystemData.Hardware.CPU.ClockSpeed      -Type ([System.Data.SqlDbType]::VarChar) -Size 20
+        Safe-AddSqlParameter -Command $cmd -Name "@TotalRAMGB"        -Value ([decimal]$SystemData.Hardware.Memory.TotalGB)      -Type ([System.Data.SqlDbType]::Decimal) -Precision 5 -Scale 2
+        Safe-AddSqlParameter -Command $cmd -Name "@PageFileGB"        -Value ([decimal]$SystemData.Hardware.Memory.PageFileGB)   -Type ([System.Data.SqlDbType]::Decimal) -Precision 5 -Scale 2
+        Safe-AddSqlParameter -Command $cmd -Name "@MemorySticks"      -Value $SystemData.Hardware.Memory.Sticks       -Type ([System.Data.SqlDbType]::Int)
+        Safe-AddSqlParameter -Command $cmd -Name "@GPUName"           -Value $SystemData.Hardware.GPU.Name            -Type ([System.Data.SqlDbType]::VarChar) -Size 100
+        Safe-AddSqlParameter -Command $cmd -Name "@GPUAdapterRAMGB"   -Value ([decimal]$SystemData.Hardware.GPU.AdapterRAMGB)    -Type ([System.Data.SqlDbType]::Decimal) -Precision 5 -Scale 2
+        Safe-AddSqlParameter -Command $cmd -Name "@GPUDriverVersion"  -Value $SystemData.Hardware.GPU.DriverVersion   -Type ([System.Data.SqlDbType]::VarChar) -Size 50
 
-        $specCmd.ExecuteNonQuery() | Out-Null
+        $cmd.ExecuteNonQuery() | Out-Null
+
+        # Ensure HardwareID for disks
+        if (-not $hardwareId) {
+            $getId = $Connection.CreateCommand()
+            $getId.Transaction = $Transaction
+            $getId.CommandText = "SELECT HardwareID FROM Hardware WHERE AssetNumber = @AssetNumber"
+            Safe-AddSqlParameter -Command $getId -Name "@AssetNumber" -Value $AssetNumber -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+            $hardwareId = [int]$getId.ExecuteScalar()
+        }
+
+        if ($SystemData.Hardware.Disks) {
+            Import-Disks -HardwareId $hardwareId -Disks $SystemData.Hardware.Disks -Connection $Connection -Transaction $Transaction
+        }
+
+        return $hardwareId
     }
     catch {
-        Write-Error "Failed to import system specs: $_"
+        Write-Error "Failed to import hardware specs: $_"
         throw
     }
 }
@@ -157,41 +285,55 @@ function Import-SystemSpecs {
 function Import-Disks {
     <#
     .SYNOPSIS
-        Imports disk information into the database
+        Imports disk information into the database.
     #>
     param(
-        [int]$SystemId,
-        [PSObject[]]$Disks,
-        [System.Data.SqlClient.SqlConnection]$Connection,
-        [System.Data.SqlClient.SqlTransaction]$Transaction
+        [Parameter(Mandatory)][int]$HardwareId,
+        [Parameter()][PSObject[]]$Disks,
+        [Parameter(Mandatory)][System.Data.SqlClient.SqlConnection]$Connection,
+        [Parameter(Mandatory)][System.Data.SqlClient.SqlTransaction]$Transaction
     )
-    
     try {
-        $diskCmd = $Connection.CreateCommand()
-        $diskCmd.Transaction = $Transaction
-        $diskCmd.CommandText = @"
-            INSERT INTO SystemDisks (
-                SystemID, DriveLetter, SizeGB, FreeGB, DiskType
-            )
-            VALUES (
-                @SystemID, @DriveLetter, @SizeGB, @FreeGB, @DiskType
-            )
-"@
-
-        # Add parameters that will be reused for each disk
-        $diskCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@SystemID", [System.Data.SqlDbType]::Int))).Value = $SystemId
-        $diskCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@DriveLetter", [System.Data.SqlDbType]::VarChar, 5))).Value = $null
-        $diskCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@SizeGB", [System.Data.SqlDbType]::Decimal))).Value = $null
-        $diskCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@FreeGB", [System.Data.SqlDbType]::Decimal))).Value = $null
-        $diskCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@DiskType", [System.Data.SqlDbType]::VarChar, 20))).Value = $null
-
         foreach ($disk in $Disks) {
-            $diskCmd.Parameters["@DriveLetter"].Value = $disk.DeviceID
-            $diskCmd.Parameters["@SizeGB"].Value = $disk.SizeGB
-            $diskCmd.Parameters["@FreeGB"].Value = $disk.FreeGB
-            $diskCmd.Parameters["@DiskType"].Value = $disk.Type
-            
-            $diskCmd.ExecuteNonQuery() | Out-Null
+            if (-not $disk.DeviceID) { continue }
+
+            # Check existence
+            $check = $Connection.CreateCommand()
+            $check.Transaction = $Transaction
+            $check.CommandText = "SELECT COUNT(*) FROM Disks WHERE HardwareID = @HardwareID AND DeviceID = @DeviceID"
+            Safe-AddSqlParameter -Command $check -Name "@HardwareID" -Value $HardwareId -Type ([System.Data.SqlDbType]::Int)
+            Safe-AddSqlParameter -Command $check -Name "@DeviceID"   -Value $disk.DeviceID -Type ([System.Data.SqlDbType]::VarChar) -Size 5
+            $exists = [int]$check.ExecuteScalar() -gt 0
+
+            $cmd = $Connection.CreateCommand()
+            $cmd.Transaction = $Transaction
+            $cmd.CommandText = if ($exists) {
+@"
+UPDATE Disks SET
+    VolumeName=@VolumeName,
+    SizeGB=@SizeGB,
+    FreeGB=@FreeGB,
+    Type=@Type
+WHERE HardwareID=@HardwareID AND DeviceID=@DeviceID
+"@
+            } else {
+@"
+INSERT INTO Disks (
+    HardwareID, DeviceID, VolumeName, SizeGB, FreeGB, Type
+) VALUES (
+    @HardwareID, @DeviceID, @VolumeName, @SizeGB, @FreeGB, @Type
+)
+"@
+            }
+
+            Safe-AddSqlParameter -Command $cmd -Name "@HardwareID" -Value $HardwareId          -Type ([System.Data.SqlDbType]::Int)
+            Safe-AddSqlParameter -Command $cmd -Name "@DeviceID"   -Value $disk.DeviceID        -Type ([System.Data.SqlDbType]::VarChar) -Size 5
+            Safe-AddSqlParameter -Command $cmd -Name "@VolumeName" -Value $disk.VolumeName      -Type ([System.Data.SqlDbType]::VarChar) -Size 100
+            Safe-AddSqlParameter -Command $cmd -Name "@SizeGB"     -Value ([decimal]$disk.SizeGB) -Type ([System.Data.SqlDbType]::Decimal) -Precision 10 -Scale 2
+            Safe-AddSqlParameter -Command $cmd -Name "@FreeGB"     -Value ([decimal]$disk.FreeGB) -Type ([System.Data.SqlDbType]::Decimal) -Precision 10 -Scale 2
+            Safe-AddSqlParameter -Command $cmd -Name "@Type"       -Value $disk.Type            -Type ([System.Data.SqlDbType]::VarChar) -Size 20
+
+            $cmd.ExecuteNonQuery() | Out-Null
         }
     }
     catch {
@@ -200,137 +342,273 @@ function Import-Disks {
     }
 }
 
-function Import-Applications {
-    <#
-    .SYNOPSIS
-        Imports installed applications into the database
-    #>
+function Convert-ToBool {
+    param([string]$value)
+    if ([string]::IsNullOrWhiteSpace($value)) { return $false }
+    switch ($value.ToLower()) {
+        'true'  { return $true }
+        'false' { return $false }
+        default { return $false }  # fallback for invalid values
+    }
+}
+
+function Import-Network {
     param(
-        [int]$SystemId,
-        [PSObject[]]$Applications,
-        [System.Data.SqlClient.SqlConnection]$Connection,
-        [System.Data.SqlClient.SqlTransaction]$Transaction
+        [Parameter(Mandatory)][string]$AssetNumber,
+        [Parameter(Mandatory)][pscustomobject]$NetworkData,
+        [Parameter(Mandatory)][System.Data.SqlClient.SqlConnection]$Connection,
+        [Parameter(Mandatory)][System.Data.SqlClient.SqlTransaction]$Transaction
     )
     
     try {
-        $appCmd = $Connection.CreateCommand()
-        $appCmd.Transaction = $Transaction
-        $appCmd.CommandText = @"
-            INSERT INTO InstalledApps (
-                SystemID, AppName, AppVersion, Publisher, InstallDate
-            )
-            VALUES (
-                @SystemID, @AppName, @AppVersion, @Publisher, @InstallDate
-            )
+        $cmd = $Connection.CreateCommand()
+        $cmd.Transaction = $Transaction
+        $cmd.CommandText = @"
+INSERT INTO Network (
+    AssetNumber, AdapterName, InterfaceDescription, MacAddress, 
+    Speed, IPAddress, DHCPEnabled
+) VALUES (
+    @AssetNumber, @AdapterName, @InterfaceDescription, @MacAddress,
+    @Speed, @IPAddress, @DHCPEnabled
+)
 "@
 
-        # Add parameters with proper null handling
-        $appCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@SystemID", [System.Data.SqlDbType]::Int))).Value = $SystemId
-        $appCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@AppName", [System.Data.SqlDbType]::VarChar, 255))).Value = $null
-        $appCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@AppVersion", [System.Data.SqlDbType]::VarChar, 100))).Value = $null
-        $appCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@Publisher", [System.Data.SqlDbType]::VarChar, 255))).Value = $null
-        $appCmd.Parameters.Add((New-Object System.Data.SqlClient.SqlParameter("@InstallDate", [System.Data.SqlDbType]::Date))).Value = $null
+        Safe-AddSqlParameter -Command $cmd -Name "@AssetNumber" -Value $AssetNumber -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+        Safe-AddSqlParameter -Command $cmd -Name "@AdapterName" -Value $NetworkData.Name -Type ([System.Data.SqlDbType]::VarChar) -Size 100
+        Safe-AddSqlParameter -Command $cmd -Name "@InterfaceDescription" -Value $NetworkData.InterfaceDescription -Type ([System.Data.SqlDbType]::VarChar) -Size 255
+        Safe-AddSqlParameter -Command $cmd -Name "@MacAddress" -Value $NetworkData.MacAddress -Type ([System.Data.SqlDbType]::VarChar) -Size 20
+        Safe-AddSqlParameter -Command $cmd -Name "@Speed" -Value $NetworkData.Speed -Type ([System.Data.SqlDbType]::VarChar) -Size 20
+        Safe-AddSqlParameter -Command $cmd -Name "@IPAddress" -Value $NetworkData.IPAddress -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+        Safe-AddSqlParameter -Command $cmd -Name "@DHCPEnabled" -Value $false -Type ([System.Data.SqlDbType]::Bit) # Default value
 
-        foreach ($app in $Applications) {
-            if (-not $app.DisplayName) { continue }
-
-            $appCmd.Parameters["@AppName"].Value = $app.DisplayName
-            
-            # Handle null/empty values properly
-            if ($app.DisplayVersion) {
-                $appCmd.Parameters["@AppVersion"].Value = $app.DisplayVersion
-            } else {
-                $appCmd.Parameters["@AppVersion"].Value = [DBNull]::Value
-            }
-            
-            if ($app.Publisher) {
-                $appCmd.Parameters["@Publisher"].Value = $app.Publisher
-            } else {
-                $appCmd.Parameters["@Publisher"].Value = [DBNull]::Value
-            }
-            
-            # Parse install date with proper format handling
-            if ($app.InstallDate -match "^\d{8}$") {
-                $appCmd.Parameters["@InstallDate"].Value = [DateTime]::ParseExact($app.InstallDate, "yyyyMMdd", $null)
-            }
-            elseif ($app.InstallDate) {
-                try {
-                    $appCmd.Parameters["@InstallDate"].Value = [DateTime]$app.InstallDate
-                }
-                catch {
-                    $appCmd.Parameters["@InstallDate"].Value = [DBNull]::Value
-                }
-            }
-            else {
-                $appCmd.Parameters["@InstallDate"].Value = [DBNull]::Value
-            }
-            
-            $appCmd.ExecuteNonQuery() | Out-Null
-        }
+        $cmd.ExecuteNonQuery() | Out-Null
     }
     catch {
-        Write-Error "Failed to import applications: $_"
+        Write-Error "Failed to import network information for asset ${AssetNumber}: $_"
         throw
     }
 }
 
-# MAIN SCRIPT EXECUTION
-# ---------------------
 
-# Get all JSON files in the reports folder
-$jsonFiles = Get-ChildItem -Path $ReportsFolder -Filter *.json -File
-
-if ($jsonFiles.Count -eq 0) {
-    Write-Host "No JSON files found in $ReportsFolder" -ForegroundColor Yellow
-    exit 0
-}
-
-foreach ($file in $jsonFiles) {
-    Write-Host "Importing $($file.Name)..." -ForegroundColor Cyan
-
+function Import-Software {
+    <#
+    .SYNOPSIS
+        Imports installed applications and hotfixes into the database.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$AssetNumber,
+        [Parameter()][PSObject]$SoftwareData,
+        [Parameter(Mandatory)][System.Data.SqlClient.SqlConnection]$Connection,
+        [Parameter(Mandatory)][System.Data.SqlClient.SqlTransaction]$Transaction
+    )
     try {
-        # Load JSON data from file
-        $json = Get-Content $file.FullName -Raw | ConvertFrom-Json
-        
-        # Set up database connection with transaction
-        $conn = New-Object System.Data.SqlClient.SqlConnection $ConnectionString
-        $conn.Open()
-        $tran = $conn.BeginTransaction()
+        # Applications
+        if ($SoftwareData.InstalledApps) {
+            foreach ($app in $SoftwareData.InstalledApps) {
+                if (-not $app.DisplayName) { continue }
 
-        # Import or update system record
-        $systemId = Import-SystemRecord -SystemData $json -Connection $conn -Transaction $tran
+                $check = $Connection.CreateCommand()
+                $check.Transaction = $Transaction
+                $check.CommandText = "SELECT COUNT(*) FROM Software WHERE AssetNumber=@AssetNumber AND AppName=@AppName AND IsApplication=1"
+                $check.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
+                $check.Parameters.AddWithValue("@AppName", $app.DisplayName) | Out-Null
+                $exists = [int]$check.ExecuteScalar() -gt 0
 
-        # Clear existing details before importing new ones
-        Clear-SystemDetails -SystemId $systemId -Connection $conn -Transaction $tran
+                $installDate = Get-SafeSqlDateTime -DateString $app.InstallDate
 
-        # Import system specifications
-        Import-SystemSpecs -SystemId $systemId -SystemData $json -Connection $conn -Transaction $tran
+                $cmd = $Connection.CreateCommand()
+                $cmd.Transaction = $Transaction
+                $cmd.CommandText = if ($exists) {
+                    "UPDATE Software SET AppVersion=@AppVersion, Publisher=@Publisher, InstallDate=@InstallDate WHERE AssetNumber=@AssetNumber AND AppName=@AppName AND IsApplication=1"
+                } else {
+                    "INSERT INTO Software (AssetNumber, AppName, AppVersion, Publisher, InstallDate, IsApplication) VALUES (@AssetNumber, @AppName, @AppVersion, @Publisher, @InstallDate, 1)"
+                }
 
-        # Import disk information
-        Import-Disks -SystemId $systemId -Disks $json.Hardware.Disks -Connection $conn -Transaction $tran
+                $cmd.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
+                $cmd.Parameters.AddWithValue("@AppName", $app.DisplayName) | Out-Null
+                $cmd.Parameters.AddWithValue("@AppVersion", ($app.DisplayVersion ?? [DBNull]::Value)) | Out-Null
+                $cmd.Parameters.AddWithValue("@Publisher", ($app.Publisher ?? [DBNull]::Value)) | Out-Null
+                $cmd.Parameters.AddWithValue("@InstallDate", $installDate) | Out-Null
 
-        # Import installed applications
-        Import-Applications -SystemId $systemId -Applications $json.Software.InstalledApps -Connection $conn -Transaction $tran
+                $cmd.ExecuteNonQuery() | Out-Null
+            }
+        }
 
-        # Commit transaction if all operations succeeded
-        $tran.Commit()
-        Write-Host "✅ Successfully imported $($json.AssetNumber)" -ForegroundColor Green
+        # Hotfixes
+        if ($SoftwareData.Hotfixes) {
+            foreach ($hotfix in $SoftwareData.Hotfixes) {
+                if (-not $hotfix.HotFixID) { continue }
+
+                $check = $Connection.CreateCommand()
+                $check.Transaction = $Transaction
+                $check.CommandText = "SELECT COUNT(*) FROM Software WHERE AssetNumber=@AssetNumber AND HotFixID=@HotFixID AND IsApplication=0"
+                $check.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
+                $check.Parameters.AddWithValue("@HotFixID", $hotfix.HotFixID) | Out-Null
+                $exists = [int]$check.ExecuteScalar() -gt 0
+
+                $installedDate =
+                    if ($hotfix.InstalledOn -and $hotfix.InstalledOn.DateTime) {
+                        Get-SafeSqlDateTime -DateString $hotfix.InstalledOn.DateTime
+                    } else { [DBNull]::Value }
+
+                $cmd = $Connection.CreateCommand()
+                $cmd.Transaction = $Transaction
+                $cmd.CommandText = if ($exists) {
+                    "UPDATE Software SET HotFixDescription=@HotFixDescription, HotFixInstalledDate=@HotFixInstalledDate WHERE AssetNumber=@AssetNumber AND HotFixID=@HotFixID AND IsApplication=0"
+                } else {
+                    "INSERT INTO Software (AssetNumber, HotFixID, HotFixDescription, HotFixInstalledDate, IsApplication) VALUES (@AssetNumber, @HotFixID, @HotFixDescription, @HotFixInstalledDate, 0)"
+                }
+
+                $cmd.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
+                $cmd.Parameters.AddWithValue("@HotFixID", $hotfix.HotFixID) | Out-Null
+                $cmd.Parameters.AddWithValue("@HotFixDescription", ($hotfix.Description ?? [DBNull]::Value)) | Out-Null
+                $cmd.Parameters.AddWithValue("@HotFixInstalledDate", $installedDate) | Out-Null
+
+                $cmd.ExecuteNonQuery() | Out-Null
+            }
+        }
     }
     catch {
-        # Rollback transaction on error
-        if ($tran -and $tran.Connection -eq $conn) {
-            $tran.Rollback()
-            Write-Host "❌ Transaction rolled back for $($file.Name)" -ForegroundColor Red
-        }
-        
-        Write-Host "❌ Error importing $($file.Name): $($_.Exception.Message)" -ForegroundColor Red
-    }
-    finally {
-        # Ensure connection is closed
-        if ($conn -and $conn.State -eq [System.Data.ConnectionState]::Open) {
-            $conn.Close()
-        }
+        Write-Error "Failed to import software information: $_"
+        throw
     }
 }
 
-Write-Host "`nImport process completed. Processed $($jsonFiles.Count) files." -ForegroundColor Green
+#endregion Import Functions
+
+#region Summary / Reporting
+
+function Show-SummaryReport {
+    <#
+    .SYNOPSIS
+        Displays a summary report of the import process.
+    #>
+    param([Parameter(Mandatory)][hashtable]$SummaryData)
+
+    Write-Host "`nIMPORT SUMMARY REPORT" -ForegroundColor Magenta
+    Write-Host "====================" -ForegroundColor Magenta
+    Write-Host "Start Time: $($SummaryData.StartTime.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Cyan
+    Write-Host "End Time:   $($SummaryData.EndTime.ToString('yyyy-MM-dd HH:mm:ss'))"   -ForegroundColor Cyan
+    Write-Host "Duration:   $($SummaryData.Duration.ToString('hh\:mm\:ss'))"           -ForegroundColor Cyan
+    Write-Host "----------------------------------------" -ForegroundColor DarkGray
+    Write-Host "Total files processed: $($SummaryData.TotalFiles)" -ForegroundColor Cyan
+    Write-Host "Successfully imported: $($SummaryData.SuccessCount)" -ForegroundColor Green
+    Write-Host "Failed imports:       $($SummaryData.FailedCount)"   -ForegroundColor Red
+
+    if ($SummaryData.SuccessCount -gt 0) {
+        Write-Host "`nSUCCESSFUL IMPORTS ($($SummaryData.SuccessAssets.Count)):" -ForegroundColor Green
+        $SummaryData.SuccessAssets | ForEach-Object { Write-Host "  - $_" -ForegroundColor Green }
+    }
+
+    if ($SummaryData.FailedCount -gt 0) {
+        Write-Host "`nFAILED IMPORTS ($($SummaryData.FailedAssets.Count)):" -ForegroundColor Red
+        $SummaryData.FailedAssets | ForEach-Object {
+            Write-Host "  - File:  $($_.FileName)"    -ForegroundColor Red
+            Write-Host "    Asset: $($_.AssetNumber)" -ForegroundColor Yellow
+            Write-Host "    Error: $($_.Error)"       -ForegroundColor DarkYellow
+            Write-Host "    ----------------------------" -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host "`nImport process completed at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Magenta
+}
+
+#endregion Summary / Reporting
+
+#region Main Execution
+
+# Initialize summary tracking
+$summary = @{
+    TotalFiles    = 0
+    SuccessCount  = 0
+    FailedCount   = 0
+    SuccessAssets = [System.Collections.Generic.List[string]]::new()
+    FailedAssets  = [System.Collections.Generic.List[hashtable]]::new()
+    StartTime     = Get-Date
+}
+
+try {
+    # Load required assembly for SQL operations
+    Add-Type -AssemblyName "System.Data" -ErrorAction Stop
+
+    # Get all JSON files in the reports folder
+    $jsonFiles = Get-ChildItem -Path $ReportsFolder -Filter *.json -File -ErrorAction Stop
+    $summary.TotalFiles = $jsonFiles.Count
+
+    if ($jsonFiles.Count -eq 0) {
+        Write-Host "No JSON files found in $ReportsFolder" -ForegroundColor Yellow
+        exit 0
+    }
+
+    foreach ($file in $jsonFiles) {
+        Write-Host "`nProcessing $($file.Name)..." -ForegroundColor Cyan
+
+        $conn = $null
+        $tran = $null
+        $assetNumber = $null
+        $json = $null
+
+        try {
+            # Load JSON data from file
+            $json = Get-Content $file.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+
+            # Set up database connection with transaction
+            $conn = New-Object System.Data.SqlClient.SqlConnection $ConnectionString
+            $conn.Open()
+            $tran = $conn.BeginTransaction()
+
+            # Import all data
+            $assetNumber = Import-SystemRecord -SystemData $json -Connection $conn -Transaction $tran
+            Import-Hardware -AssetNumber $assetNumber -SystemData $json -Connection $conn -Transaction $tran
+            Import-Network  -AssetNumber $assetNumber -NetworkData $json.Network   -Connection $conn -Transaction $tran
+            Import-Software -AssetNumber $assetNumber -SoftwareData $json.Software -Connection $conn -Transaction $tran
+
+            # Commit transaction if all operations succeeded
+            $tran.Commit()
+            Write-Host "✅ Successfully imported $assetNumber" -ForegroundColor Green
+
+            # Update success summary
+            $summary.SuccessCount++
+            $summary.SuccessAssets.Add($assetNumber)
+        }
+        catch {
+            # Rollback transaction on error
+            if ($tran -and $tran.Connection -eq $conn) {
+                try { $tran.Rollback(); Write-Host "❌ Transaction rolled back for $($file.Name)" -ForegroundColor Red }
+                catch { Write-Host "❌ Failed to rollback transaction: $_" -ForegroundColor DarkRed }
+            }
+
+            $errorMsg = "Error importing $($file.Name): $($_.Exception.Message)"
+            Write-Host "❌ $errorMsg" -ForegroundColor Red
+            Write-Host "Error details: $($_.ScriptStackTrace)" -ForegroundColor DarkYellow
+
+            # Update failure summary
+            $summary.FailedCount++
+            $summary.FailedAssets.Add(@{
+                FileName    = $file.Name
+                AssetNumber = if ($assetNumber) { $assetNumber } else { try { $json.AssetNumber } catch { "N/A" } }
+                Error       = $errorMsg
+            })
+        }
+        finally {
+            if ($conn) {
+                if ($conn.State -eq [System.Data.ConnectionState]::Open) { $conn.Close() }
+                $conn.Dispose()
+            }
+        }
+    }
+}
+catch {
+    Write-Host "❌ Fatal error during import process: $($_.Exception.Message)" -ForegroundColor Red
+    $summary.FailedCount = $summary.TotalFiles
+}
+finally {
+    $summary.EndTime = Get-Date
+    $summary.Duration = $summary.EndTime - $summary.StartTime
+    Show-SummaryReport -SummaryData $summary
+}
+
+#endregion Main Execution
+
+# Return summary object if needed by calling script
+$summary

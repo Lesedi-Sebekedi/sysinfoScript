@@ -4,14 +4,16 @@
 .DESCRIPTION
     Creates a responsive local web dashboard to view system inventory from SQL database
     Features:
-    - Paginated system listings
-    - Detailed system views
-    - Search functionality
+    - Paginated system listings with sorting
+    - Detailed system views with tabs
+    - Advanced search functionality
     - Automatic refresh
     - Secure HTML rendering
+    - Performance monitoring
+    - Export capabilities
 .NOTES
-    Author: Your Name
-    Version: 1.3
+    Author: Lesedi Sebekedi
+    Version: 2.0
     Last Updated: $(Get-Date -Format "yyyy-MM-dd")
 #>
 
@@ -19,10 +21,22 @@
 # Dashboard settings
 $port = 8080  # Web server listening port
 $dashboardTitle = "System Inventory Dashboard"
-$companyName = "Nowth West Provincial Treasury"
+$companyName = "North West Provincial Treasury"
 $defaultRowCount = 20  # Number of items per page
 $connectionString = "Server=PTLSEBEKEDI;Database=AssetDB;Integrated Security=True;TrustServerCertificate=True"
+$enablePerformanceLogging = $true
+$performanceLogPath = "$env:TEMP\DashboardPerformance.log"
 #endregion
+
+# Load required SQL module
+try {
+    Import-Module SqlServer -ErrorAction Stop
+}
+catch {
+    Write-Host "SQL Server module not found. Installing..."
+    Install-Module -Name SqlServer -Force -AllowClobber -Scope CurrentUser
+    Import-Module SqlServer
+}
 
 #region HTML TEMPLATES
 # Main HTML structure with embedded CSS and JavaScript
@@ -36,6 +50,7 @@ $htmlHeader = @"
     <!-- External CSS libraries -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css">
     <style>
         /* Custom styling for dashboard elements */
         .system-card:hover {
@@ -65,6 +80,28 @@ $htmlHeader = @"
         .back-button {
             margin-bottom: 20px;
         }
+        .nav-tabs .nav-link.active {
+            font-weight: bold;
+            border-bottom: 3px solid #4a6cf7;
+        }
+        .badge-custom {
+            font-size: 0.8em;
+            font-weight: normal;
+        }
+        .disk-usage {
+            height: 10px;
+            border-radius: 5px;
+        }
+        .disk-usage-bar {
+            height: 100%;
+            border-radius: 5px;
+        }
+        .tab-content {
+            padding: 15px 0;
+        }
+        .export-btn {
+            margin-left: 10px;
+        }
     </style>
 </head>
 <body>
@@ -93,6 +130,9 @@ $htmlFooter = @"
     
     <!-- JavaScript libraries and functions -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
     <script>
         // Live clock update function
         function updateClock() {
@@ -106,6 +146,29 @@ $htmlFooter = @"
         setTimeout(function() {
             window.location.reload();
         }, 300000);
+        
+        // Initialize DataTables for tables with class 'datatable'
+        `$(document).ready(function() {
+            `$('.datatable').DataTable({
+                responsive: true,
+                pageLength: 10,
+                lengthMenu: [5, 10, 25, 50, 100]
+            });
+        });
+        
+        // Export button functionality
+        function exportData(format) {
+            const searchParams = new URLSearchParams(window.location.search);
+            const assetNumber = searchParams.get('AssetNumber') || '';
+            const searchTerm = searchParams.get('search') || '';
+            const page = searchParams.get('page') || 1;
+            
+            if (assetNumber) {
+                window.location.href = `/export?AssetNumber=${assetNumber}&format=${format}`;
+            } else {
+                window.location.href = `/export?search=${searchTerm}&page=${page}&format=${format}`;
+            }
+        }
     </script>
 </body>
 </html>
@@ -116,70 +179,79 @@ $htmlFooter = @"
 
 <#
 .SYNOPSIS
-    Retrieves paginated system records from the database
-.DESCRIPTION
-    Executes SQL query to fetch system records with optional search filtering
-    Returns both the records and total count for pagination
-.PARAMETER searchTerm
-    Optional term to filter systems by asset number or host name
-.PARAMETER page
-    Page number to retrieve (1-based)
-.PARAMETER pageSize
-    Number of records per page
+    Retrieves paginated system records from the database with sorting
 #>
 function Get-SystemRecords {
     param(
         [string]$searchTerm = "",
         [int]$page = 1,
-        [int]$pageSize = $defaultRowCount
+        [int]$pageSize = $defaultRowCount,
+        [string]$sortColumn = "ScanDate",
+        [string]$sortDirection = "DESC"
     )
     
     try {
         $offset = ($page - 1) * $pageSize
         
-        # Build SQL query based on whether we're filtering
-        if ([string]::IsNullOrWhiteSpace($searchTerm)) {
-            $query = @"
-            SELECT 
-                s.SystemID,
-                s.AssetNumber, 
-                s.HostName, 
-                sp.OSName, 
-                sp.TotalRAMGB,
-                s.ScanDate,
-                COUNT(*) OVER() AS TotalCount
-            FROM Systems s
-            JOIN SystemSpecs sp ON s.SystemID = sp.SystemID
-            ORDER BY s.ScanDate DESC
-            OFFSET $offset ROWS
-            FETCH NEXT $pageSize ROWS ONLY
+        # Create connection and command objects
+        $conn = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $conn.Open()
+        
+        # Validate sort column to prevent SQL injection
+        $validColumns = @("AssetNumber", "HostName", "OS", "TotalRAMGB", "ScanDate")
+        if ($validColumns -notcontains $sortColumn) {
+            $sortColumn = "ScanDate"
+        }
+        
+        # Validate sort direction
+        $sortDirection = if ($sortDirection -eq "ASC") { "ASC" } else { "DESC" }
+        
+        # Build base query with explicit table references
+        $query = @"
+        SELECT 
+            s.AssetNumber, 
+            s.HostName, 
+            s.OS, 
+            h.TotalRAMGB,
+            s.ScanDate,
+            COUNT(*) OVER() AS TotalCount
+        FROM Systems s
+        LEFT JOIN Hardware h ON s.AssetNumber = h.AssetNumber
 "@
-        } else {
-            $escapedTerm = $searchTerm -replace "'", "''"  # Escape single quotes for SQL
-            $query = @"
-            SELECT 
-                s.SystemID,
-                s.AssetNumber, 
-                s.HostName, 
-                sp.OSName, 
-                sp.TotalRAMGB,
-                s.ScanDate,
-                COUNT(*) OVER() AS TotalCount
-            FROM Systems s
-            JOIN SystemSpecs sp ON s.SystemID = sp.SystemID
-            WHERE s.AssetNumber LIKE '%$escapedTerm%' 
-               OR s.HostName LIKE '%$escapedTerm%'
-            ORDER BY s.ScanDate DESC
-            OFFSET $offset ROWS
-            FETCH NEXT $pageSize ROWS ONLY
-"@
+
+        # Add WHERE clause if search term provided
+        $whereClause = ""
+        $params = @{}
+        
+        if (-not [string]::IsNullOrWhiteSpace($searchTerm)) {
+            $whereClause = "WHERE s.AssetNumber LIKE @searchTerm OR s.HostName LIKE @searchTerm OR s.OS LIKE @searchTerm"
+            $params["@searchTerm"] = "%$searchTerm%"
         }
 
-        $results = Invoke-Sqlcmd -ConnectionString $connectionString -Query $query
+        # Add ORDER BY and paging
+        $query += @"
+        $whereClause
+        ORDER BY $sortColumn $sortDirection
+        OFFSET $offset ROWS
+        FETCH NEXT $pageSize ROWS ONLY
+"@
+
+        # Execute query with parameters
+        $cmd = New-Object System.Data.SqlClient.SqlCommand($query, $conn)
+        foreach ($key in $params.Keys) {
+            $cmd.Parameters.AddWithValue($key, $params[$key]) | Out-Null
+        }
+
+        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+        $dataset = New-Object System.Data.DataSet
+        $adapter.Fill($dataset) | Out-Null
         
+        $results = $dataset.Tables[0]
+        $conn.Close()
+
         return @{
-            Records = $results | Select-Object SystemID, AssetNumber, HostName, OSName, TotalRAMGB, ScanDate
-            TotalCount = if ($results) { $results[0].TotalCount } else { 0 }
+            Records = $results | Select-Object AssetNumber, HostName, OS, TotalRAMGB, ScanDate
+            TotalCount = if ($results.Rows.Count -gt 0) { $results.Rows[0].TotalCount } else { 0 }
         }
     }
     catch {
@@ -191,116 +263,387 @@ function Get-SystemRecords {
 <#
 .SYNOPSIS
     Retrieves detailed information about a specific system
-.DESCRIPTION
-    Fetches system details and installed applications for display
-.PARAMETER systemId
-    The ID of the system to retrieve details for
 #>
 function Show-SystemDetails {
-    param($systemId)
+    param($AssetNumber)
     
     try {
+        # Create connection
+        $conn = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $conn.Open()
+
         # Query for basic system details
-        $query = @"
+        $systemQuery = @"
         SELECT 
             s.AssetNumber,
             s.HostName,
             s.SerialNumber,
+            s.OS,
+            s.Version,
+            s.Architecture,
+            s.Manufacturer,
+            s.Model,
+            s.BootTime,
+            s.BIOSVersion,
             s.ScanDate,
-            sp.*
+            s.PSVersion,
+            h.CPUName,
+            h.CPUCores,
+            h.CPUThreads,
+            h.CPUClockSpeed,
+            h.TotalRAMGB,
+            h.PageFileGB,
+            h.MemorySticks,
+            h.GPUName,
+            h.GPUAdapterRAMGB,
+            h.GPUDriverVersion,
+            n.IPAddress,
+            n.MacAddress,
+            n.SubnetMask,
+            n.DefaultGateway,
+            n.DNSServers
         FROM Systems s
-        JOIN SystemSpecs sp ON s.SystemID = sp.SystemID
-        WHERE s.SystemID = $systemId
+        LEFT JOIN Hardware h ON s.AssetNumber = h.AssetNumber
+        LEFT JOIN Network n ON s.AssetNumber = n.AssetNumber
+        WHERE s.AssetNumber = @AssetNumber
 "@
-        $details = Invoke-Sqlcmd -ConnectionString $connectionString -Query $query
+        $cmd = New-Object System.Data.SqlClient.SqlCommand($systemQuery, $conn)
+        $cmd.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
         
+        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+        $dataset = New-Object System.Data.DataSet
+        $adapter.Fill($dataset) | Out-Null
+        $details = $dataset.Tables[0].Rows[0]
+
         # Query for installed applications
-        $installedAppsQuery = @"
-        SELECT AppName, AppVersion
-        FROM InstalledApps
-        WHERE SystemID = $systemId
+        $appsQuery = @"
+        SELECT AppName, AppVersion, Publisher, InstallDate
+        FROM Software
+        WHERE AssetNumber = @AssetNumber AND IsApplication = 1
         ORDER BY AppName
 "@
-        $installedApps = Invoke-Sqlcmd -ConnectionString $connectionString -Query $installedAppsQuery
+        $cmd = New-Object System.Data.SqlClient.SqlCommand($appsQuery, $conn)
+        $cmd.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
+        
+        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+        $dataset = New-Object System.Data.DataSet
+        $adapter.Fill($dataset) | Out-Null
+        $installedApps = $dataset.Tables[0]
 
-        # Handle case where query returns an array
-        if ($details -is [System.Array]) { 
-            $details = $details[0] 
+        # Query for hotfixes
+        $hotfixQuery = @"
+        SELECT HotFixID, HotFixDescription, HotFixInstalledDate
+        FROM Software
+        WHERE AssetNumber = @AssetNumber AND IsApplication = 0
+        ORDER BY HotFixInstalledDate DESC
+"@
+        $cmd = New-Object System.Data.SqlClient.SqlCommand($hotfixQuery, $conn)
+        $cmd.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
+        
+        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+        $dataset = New-Object System.Data.DataSet
+        $adapter.Fill($dataset) | Out-Null
+        $hotfixes = $dataset.Tables[0]
+
+        # Query for disks
+        $disksQuery = @"
+        SELECT d.DeviceID, d.VolumeName, d.SizeGB, d.FreeGB, d.Type
+        FROM Disks d
+        JOIN Hardware h ON d.HardwareID = h.HardwareID
+        WHERE h.AssetNumber = @AssetNumber
+        ORDER BY d.DeviceID
+"@
+        $cmd = New-Object System.Data.SqlClient.SqlCommand($disksQuery, $conn)
+        $cmd.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
+        
+        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+        $dataset = New-Object System.Data.DataSet
+        $adapter.Fill($dataset) | Out-Null
+        $disks = $dataset.Tables[0]
+
+        $conn.Close()
+
+        # Generate HTML for installed applications list
+        $appsHtml = ""
+        if ($installedApps.Rows.Count -gt 0) {
+            $appsHtml += "<table class='table table-sm datatable'>"
+            $appsHtml += "<thead><tr><th>Application</th><th>Version</th><th>Publisher</th><th>Installed</th></tr></thead>"
+            $appsHtml += "<tbody>"
+            foreach ($row in $installedApps.Rows) {
+                $displayName = Encode-HTML $row["AppName"]
+                $version = if ([string]::IsNullOrWhiteSpace($row["AppVersion"])) { 
+                    "Unknown" 
+                } else { 
+                    Encode-HTML $row["AppVersion"]
+                }
+                $publisher = Encode-HTML $row["Publisher"]
+                $installDate = if ([DBNull]::Value.Equals($row["InstallDate"])) { 
+                    "Unknown" 
+                } else { 
+                    ([DateTime]$row["InstallDate"]).ToString("yyyy-MM-dd")
+                }
+                
+                $appsHtml += @"
+<tr>
+    <td>$displayName</td>
+    <td>$version</td>
+    <td>$publisher</td>
+    <td>$installDate</td>
+</tr>
+"@
+            }
+            $appsHtml += "</tbody></table>"
+        } else {
+            $appsHtml = "<div class='alert alert-info'>No application data available</div>"
         }
 
-        if ($details) {
-            # Generate HTML for installed applications list
-            $appsHtml = ""
-            if ($installedApps -and $installedApps.Count -gt 0) {
-                $appsHtml += "<ul class='list-group'>"
-                foreach ($app in $installedApps) {
-                    $displayName = Encode-HTML $app.AppName
-                    $version = if ([string]::IsNullOrWhiteSpace($app.AppVersion)) { 
-                        "Unknown" 
-                    } else { 
-                        Encode-HTML $app.AppVersion 
-                    }
-                    $appsHtml += @"
-<li class='list-group-item d-flex align-items-center'>
-    <img src='https://cdn-icons-png.flaticon.com/512/888/888879.png' 
-         alt='App' 
-         class='app-icon'>
-    <div>
-        <strong>$displayName</strong><br>
-        <small class='text-muted'>Version: $version</small>
-    </div>
-</li>
-"@
+        # Generate HTML for hotfixes
+        $hotfixHtml = ""
+        if ($hotfixes.Rows.Count -gt 0) {
+            $hotfixHtml += "<table class='table table-sm datatable'>"
+            $hotfixHtml += "<thead><tr><th>Hotfix ID</th><th>Description</th><th>Installed On</th></tr></thead>"
+            $hotfixHtml += "<tbody>"
+            foreach ($row in $hotfixes.Rows) {
+                $hotfixId = Encode-HTML $row["HotFixID"]
+                $description = Encode-HTML $row["HotFixDescription"]
+                $installedDate = if ([DBNull]::Value.Equals($row["HotFixInstalledDate"])) { 
+                    "Unknown" 
+                } else { 
+                    ([DateTime]$row["HotFixInstalledDate"]).ToString("yyyy-MM-dd")
                 }
-                $appsHtml += "</ul>"
-            } else {
-                $appsHtml = "<em>No application data available</em>"
+                
+                $hotfixHtml += @"
+<tr>
+    <td>$hotfixId</td>
+    <td>$description</td>
+    <td>$installedDate</td>
+</tr>
+"@
             }
+            $hotfixHtml += "</tbody></table>"
+        } else {
+            $hotfixHtml = "<div class='alert alert-info'>No hotfix data available</div>"
+        }
 
-            # Build the complete details HTML
-            $html = @"
-            <div class="card mb-4">
-                <div class="card-header bg-primary text-white">
-                    <h5 class="mb-0">System Details: $(Encode-HTML $details.HostName)</h5>
+        # Generate HTML for disks
+        $disksHtml = ""
+        if ($disks.Rows.Count -gt 0) {
+            $disksHtml += "<table class='table table-sm datatable'>"
+            $disksHtml += "<thead><tr><th>Device</th><th>Volume</th><th>Type</th><th>Size</th><th>Free</th><th>Usage</th></tr></thead>"
+            $disksHtml += "<tbody>"
+            foreach ($row in $disks.Rows) {
+                $deviceId = Encode-HTML $row["DeviceID"]
+                $volumeName = Encode-HTML $row["VolumeName"]
+                $type = Encode-HTML $row["Type"]
+                $sizeGB = [math]::Round($row["SizeGB"], 2)
+                $freeGB = [math]::Round($row["FreeGB"], 2)
+                $usedGB = $sizeGB - $freeGB
+                $usedPercent = if ($sizeGB -gt 0) { [math]::Round(($usedGB / $sizeGB) * 100) } else { 0 }
+                
+                $usageColor = if ($usedPercent -gt 90) { "bg-danger" } elseif ($usedPercent -gt 70) { "bg-warning" } else { "bg-success" }
+                
+                $disksHtml += @"
+<tr>
+    <td>$deviceId</td>
+    <td>$volumeName</td>
+    <td>$type</td>
+    <td>$sizeGB GB</td>
+    <td>$freeGB GB</td>
+    <td>
+        <div class="disk-usage bg-light">
+            <div class="disk-usage-bar $usageColor" style="width: $usedPercent%"></div>
+        </div>
+        <small>$usedPercent% used</small>
+    </td>
+</tr>
+"@
+            }
+            $disksHtml += "</tbody></table>"
+        } else {
+            $disksHtml = "<div class='alert alert-info'>No disk data available</div>"
+        }
+
+        # Build the complete details HTML with tabs
+        $html = @"
+        <div class="card mb-4">
+            <div class="card-header bg-primary text-white">
+                <div class="d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0">System Details: $(Encode-HTML $details["HostName"])</h5>
+                    <div>
+                        <button class="btn btn-sm btn-light export-btn" onclick="exportData('csv')">
+                            <i class="fas fa-file-csv me-1"></i>Export CSV
+                        </button>
+                        <button class="btn btn-sm btn-light export-btn" onclick="exportData('json')">
+                            <i class="fas fa-file-code me-1"></i>Export JSON
+                        </button>
+                    </div>
                 </div>
-                <div class="card-body">
-                    <div class="row">
-                        <!-- Basic Information Column -->
-                        <div class="col-md-6">
-                            <h6>Basic Information</h6>
-                            <table class="table table-sm">
-                                $(Render-DetailRow "Asset Number" $details.AssetNumber)
-                                $(Render-DetailRow "Host Name" $details.HostName)
-                                $(Render-DetailRow "Serial Number" $details.SerialNumber)
-                                $(Render-DetailRow "Last Scan" $details.ScanDate)
-                            </table>
-                        </div>
-                        
-                        <!-- System Specifications Column -->
-                        <div class="col-md-6">
-                            <h6>System Specifications</h6>
-                            <table class="table table-sm">
-                                $(Render-DetailRow "OS" $details.OSName)
-                                $(Render-DetailRow "Architecture" $details.Architecture)
-                                $(Render-DetailRow "CPU Cores" $details.CPUCores)
-                                $(Render-DetailRow "Total RAM" "$([math]::Round($details.TotalRAMGB, 2)) GB")
-                            </table>
+            </div>
+            <div class="card-body">
+                <!-- System summary badges -->
+                <div class="mb-4">
+                    <span class="badge bg-secondary me-2 badge-custom">
+                        <i class="fas fa-hashtag me-1"></i>$(Encode-HTML $details["AssetNumber"])
+                    </span>
+                    <span class="badge bg-info me-2 badge-custom">
+                        <i class="fas fa-microchip me-1"></i>$(Encode-HTML $details["CPUName"])
+                    </span>
+                    <span class="badge bg-info me-2 badge-custom">
+                        <i class="fas fa-memory me-1"></i>$([math]::Round($details["TotalRAMGB"], 2)) GB RAM
+                    </span>
+                    <span class="badge bg-info me-2 badge-custom">
+                        <i class="fas fa-network-wired me-1"></i>$(Encode-HTML $details["IPAddress"])
+                    </span>
+                    <span class="badge bg-info me-2 badge-custom">
+                        <i class="fas fa-clock me-1"></i>Last scanned: $(Encode-HTML $details["ScanDate"])
+                    </span>
+                </div>
+                
+                <!-- Tab navigation -->
+                <ul class="nav nav-tabs" id="systemDetailsTabs" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="overview-tab" data-bs-toggle="tab" data-bs-target="#overview" type="button" role="tab">
+                            <i class="fas fa-info-circle me-1"></i>Overview
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="hardware-tab" data-bs-toggle="tab" data-bs-target="#hardware" type="button" role="tab">
+                            <i class="fas fa-microchip me-1"></i>Hardware
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="software-tab" data-bs-toggle="tab" data-bs-target="#software" type="button" role="tab">
+                            <i class="fas fa-windows me-1"></i>Software
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="storage-tab" data-bs-toggle="tab" data-bs-target="#storage" type="button" role="tab">
+                            <i class="fas fa-hdd me-1"></i>Storage
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="network-tab" data-bs-toggle="tab" data-bs-target="#network" type="button" role="tab">
+                            <i class="fas fa-network-wired me-1"></i>Network
+                        </button>
+                    </li>
+                </ul>
+                
+                <!-- Tab content -->
+                <div class="tab-content" id="systemDetailsTabsContent">
+                    <!-- Overview tab -->
+                    <div class="tab-pane fade show active" id="overview" role="tabpanel">
+                        <div class="row mt-3">
+                            <div class="col-md-6">
+                                <h6><i class="fas fa-info-circle me-2"></i>System Information</h6>
+                                <table class="table table-sm">
+                                    $(Render-DetailRow "Host Name" $details["HostName"])
+                                    $(Render-DetailRow "Asset Number" $details["AssetNumber"])
+                                    $(Render-DetailRow "Serial Number" $details["SerialNumber"])
+                                    $(Render-DetailRow "Manufacturer" $details["Manufacturer"])
+                                    $(Render-DetailRow "Model" $details["Model"])
+                                    $(Render-DetailRow "Last Scan" $details["ScanDate"])
+                                </table>
+                            </div>
+                            <div class="col-md-6">
+                                <h6><i class="fas fa-windows me-2"></i>Operating System</h6>
+                                <table class="table table-sm">
+                                    $(Render-DetailRow "OS" $details["OS"])
+                                    $(Render-DetailRow "Version" $details["Version"])
+                                    $(Render-DetailRow "Architecture" $details["Architecture"])
+                                    $(Render-DetailRow "Build" $details["Build"])
+                                    $(Render-DetailRow "PowerShell" $details["PSVersion"])
+                                    $(Render-DetailRow "Boot Time" $details["BootTime"])
+                                </table>
+                            </div>
                         </div>
                     </div>
                     
-                    <!-- Installed Applications Section -->
-                    <div class="mt-3">
-                        <h6>Installed Applications</h6>
-                        <div class="bg-light p-3 rounded">
-                            $appsHtml
+                    <!-- Hardware tab -->
+                    <div class="tab-pane fade" id="hardware" role="tabpanel">
+                        <div class="row mt-3">
+                            <div class="col-md-6">
+                                <h6><i class="fas fa-microchip me-2"></i>Processor</h6>
+                                <table class="table table-sm">
+                                    $(Render-DetailRow "CPU Name" $details["CPUName"])
+                                    $(Render-DetailRow "Cores" $details["CPUCores"])
+                                    $(Render-DetailRow "Threads" $details["CPUThreads"])
+                                    $(Render-DetailRow "Clock Speed" $details["CPUClockSpeed"])
+                                </table>
+                                
+                                <h6><i class="fas fa-memory me-2"></i>Memory</h6>
+                                <table class="table table-sm">
+                                    $(Render-DetailRow "Total RAM" "$([math]::Round($details["TotalRAMGB"], 2)) GB")
+                                    $(Render-DetailRow "Page File" "$([math]::Round($details["PageFileGB"], 2)) GB")
+                                    $(Render-DetailRow "Memory Sticks" $details["MemorySticks"])
+                                </table>
+                            </div>
+                            <div class="col-md-6">
+                                <h6><i class="fas fa-desktop me-2"></i>Graphics</h6>
+                                <table class="table table-sm">
+                                    $(Render-DetailRow "GPU Name" $details["GPUName"])
+                                    $(Render-DetailRow "GPU RAM" "$([math]::Round($details["GPUAdapterRAMGB"], 2)) GB")
+                                    $(Render-DetailRow "Driver Version" $details["GPUDriverVersion"])
+                                </table>
+                                
+                                <h6><i class="fas fa-barcode me-2"></i>BIOS</h6>
+                                <table class="table table-sm">
+                                    $(Render-DetailRow "Version" $details["BIOSVersion"])
+                                    $(Render-DetailRow "Serial Number" $details["SerialNumber"])
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Software tab -->
+                    <div class="tab-pane fade" id="software" role="tabpanel">
+                        <ul class="nav nav-pills mb-3" id="software-tabs" role="tablist">
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link active" id="applications-tab" data-bs-toggle="pill" data-bs-target="#applications" type="button">
+                                    <i class="fas fa-box me-1"></i>Applications ($($installedApps.Rows.Count))
+                                </button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="hotfixes-tab" data-bs-toggle="pill" data-bs-target="#hotfixes" type="button">
+                                    <i class="fas fa-patch me-1"></i>Hotfixes ($($hotfixes.Rows.Count))
+                                </button>
+                            </li>
+                        </ul>
+                        
+                        <div class="tab-content">
+                            <div class="tab-pane fade show active" id="applications" role="tabpanel">
+                                $appsHtml
+                            </div>
+                            <div class="tab-pane fade" id="hotfixes" role="tabpanel">
+                                $hotfixHtml
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Storage tab -->
+                    <div class="tab-pane fade" id="storage" role="tabpanel">
+                        $disksHtml
+                    </div>
+                    
+                    <!-- Network tab -->
+                    <div class="tab-pane fade" id="network" role="tabpanel">
+                        <div class="row mt-3">
+                            <div class="col-md-6">
+                                <h6><i class="fas fa-network-wired me-2"></i>Network Configuration</h6>
+                                <table class="table table-sm">
+                                    $(Render-DetailRow "IP Address" $details["IPAddress"])
+                                    $(Render-DetailRow "MAC Address" $details["MacAddress"])
+                                    $(Render-DetailRow "Subnet Mask" $details["SubnetMask"])
+                                    $(Render-DetailRow "Default Gateway" $details["DefaultGateway"])
+                                    $(Render-DetailRow "DNS Servers" $details["DNSServers"])
+                                </table>
+                            </div>
                         </div>
                     </div>
                 </div>
             </div>
+        </div>
 "@
-            return $html
-        }
-        return "<div class='alert alert-warning'>System details not found</div>"
+        return $html
     }
     catch {
         return "<div class='alert alert-danger'>Error loading system details: $(Encode-HTML $_.Exception.Message)</div>"
@@ -314,6 +657,12 @@ function Show-SystemDetails {
 function Render-DetailRow {
     param($label, $value)
     
+    if ([DBNull]::Value.Equals($value) -or $value -eq $null) {
+        $value = "N/A"
+    }
+    elseif ($value -is [DateTime]) {
+        $value = $value.ToString("yyyy-MM-dd HH:mm:ss")
+    }
     return @"
 <tr>
     <th>$(Encode-HTML $label)</th>
@@ -325,9 +674,6 @@ function Render-DetailRow {
 <#
 .SYNOPSIS
     Generates HTML for pagination controls
-.DESCRIPTION
-    Creates pagination links with proper active/disables states
-    Shows limited page range around current page with ellipsis
 #>
 function Get-PaginationHtml {
     param(
@@ -342,7 +688,7 @@ function Get-PaginationHtml {
 
     $html = "<nav aria-label='Page navigation'><ul class='pagination justify-content-center'>"
     
-    # Previous button (disabled if on first page)
+    # Previous button
     $prevDisabled = if ($currentPage -le 1) { "disabled" } else { "" }
     $prevPage = [math]::Max(1, $currentPage - 1)
     $html += "<li class='page-item $prevDisabled'>" +
@@ -378,7 +724,7 @@ function Get-PaginationHtml {
                  "<a class='page-link' href='/?page=$totalPages&search=$(Encode-HTML $searchTerm)'>$totalPages</a></li>"
     }
     
-    # Next button (disabled if on last page)
+    # Next button
     $nextDisabled = if ($currentPage -ge $totalPages) { "disabled" } else { "" }
     $nextPage = [math]::Min($totalPages, $currentPage + 1)
     $html += "<li class='page-item $nextDisabled'>" +
@@ -391,19 +737,195 @@ function Get-PaginationHtml {
 
 <#
 .SYNOPSIS
+    Exports system data in specified format
+#>
+function Export-SystemData {
+    param(
+        [string]$AssetNumber = "",
+        [string]$searchTerm = "",
+        [int]$page = 1,
+        [string]$format = "csv"
+    )
+    
+    try {
+        $conn = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+        $conn.Open()
+
+        if (-not [string]::IsNullOrWhiteSpace($AssetNumber)) {
+            # Export single system details
+            $query = @"
+            SELECT 
+                s.*, 
+                h.*,
+                n.*
+            FROM Systems s
+            LEFT JOIN Hardware h ON s.AssetNumber = h.AssetNumber
+            LEFT JOIN Network n ON s.AssetNumber = n.AssetNumber
+            WHERE s.AssetNumber = @AssetNumber
+"@
+            $cmd = New-Object System.Data.SqlClient.SqlCommand($query, $conn)
+            $cmd.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
+            
+            $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+            $dataset = New-Object System.Data.DataSet
+            $adapter.Fill($dataset) | Out-Null
+            $data = $dataset.Tables[0]
+        }
+        else {
+            # Export multiple systems
+            $offset = ($page - 1) * $defaultRowCount
+            
+            $query = @"
+            SELECT 
+                s.AssetNumber, 
+                s.HostName, 
+                s.OS, 
+                s.Version,
+                s.Architecture,
+                s.Manufacturer,
+                s.Model,
+                h.CPUName,
+                h.CPUCores,
+                h.TotalRAMGB,
+                s.ScanDate
+            FROM Systems s
+            LEFT JOIN Hardware h ON s.AssetNumber = h.AssetNumber
+"@
+            $whereClause = ""
+            $params = @{}
+            
+            if (-not [string]::IsNullOrWhiteSpace($searchTerm)) {
+                $whereClause = "WHERE s.AssetNumber LIKE @searchTerm OR s.HostName LIKE @searchTerm OR s.OS LIKE @searchTerm"
+                $params["@searchTerm"] = "%$searchTerm%"
+            }
+
+            $query += @"
+            $whereClause
+            ORDER BY s.ScanDate DESC
+            OFFSET $offset ROWS
+            FETCH NEXT $defaultRowCount ROWS ONLY
+"@
+
+            $cmd = New-Object System.Data.SqlClient.SqlCommand($query, $conn)
+            foreach ($key in $params.Keys) {
+                $cmd.Parameters.AddWithValue($key, $params[$key]) | Out-Null
+            }
+
+            $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+            $dataset = New-Object System.Data.DataSet
+            $adapter.Fill($dataset) | Out-Null
+            $data = $dataset.Tables[0]
+        }
+
+        $conn.Close()
+
+        # Convert to requested format
+        switch ($format.ToLower()) {
+            "csv" {
+                $output = New-Object System.Text.StringBuilder
+                
+                # Add header row
+                $headerRow = $data.Columns | ForEach-Object { $_.ColumnName }
+                $output.AppendLine(($headerRow -join ",")) | Out-Null
+                
+                # Add data rows
+                foreach ($row in $data.Rows) {
+                    $dataRow = $data.Columns | ForEach-Object { 
+                        $value = $row[$_]
+                        if ($value -is [DateTime]) {
+                            $value.ToString("yyyy-MM-dd HH:mm:ss")
+                        }
+                        elseif ($value -eq [DBNull]::Value) {
+                            ""
+                        }
+                        else {
+                            '"' + $value.ToString().Replace('"', '""') + '"'
+                        }
+                    }
+                    $output.AppendLine(($dataRow -join ",")) | Out-Null
+                }
+                
+                return $output.ToString()
+            }
+            "json" {
+                $result = @()
+                foreach ($row in $data.Rows) {
+                    $item = @{}
+                    foreach ($column in $data.Columns) {
+                        $value = $row[$column]
+                        if ($value -is [DateTime]) {
+                            $item[$column.ColumnName] = $value.ToString("yyyy-MM-ddTHH:mm:ss")
+                        }
+                        elseif ($value -eq [DBNull]::Value) {
+                            $item[$column.ColumnName] = $null
+                        }
+                        else {
+                            $item[$column.ColumnName] = $value
+                        }
+                    }
+                    $result += $item
+                }
+                
+                if ($result.Count -eq 1) {
+                    return $result[0] | ConvertTo-Json -Depth 5
+                }
+                else {
+                    return $result | ConvertTo-Json -Depth 5
+                }
+            }
+            default {
+                throw "Unsupported export format: $format"
+            }
+        }
+    }
+    catch {
+        Write-Error "Export failed: $_"
+        throw
+    }
+}
+
+<#
+.SYNOPSIS
+    Logs performance metrics for dashboard operations
+#>
+function Log-Performance {
+    param(
+        [string]$operation,
+        [double]$durationMs,
+        [string]$details = ""
+    )
+    
+    if (-not $enablePerformanceLogging) { return }
+    
+    $logEntry = @{
+        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Operation = $operation
+        DurationMs = $durationMs
+        Details = $details
+    } | ConvertTo-Json -Compress
+    
+    try {
+        Add-Content -Path $performanceLogPath -Value $logEntry -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Warning "Failed to write to performance log: $_"
+    }
+}
+
+<#
+.SYNOPSIS
     Renders the complete dashboard HTML
-.DESCRIPTION
-    Combines all components (search, details, listings, pagination)
-    into the final HTML page
 #>
 function Render-Dashboard {
     param(
         [string]$searchTerm = "",
         [int]$page = 1,
-        [int]$systemId = 0
+        [string]$AssetNumber = ""
     )
     
-    # Build search form (this should always show)
+    $startTime = Get-Date
+    
+    # Build search form
     $searchForm = @"
         <div class="card search-box mb-4">
             <div class="card-body">
@@ -414,7 +936,7 @@ function Render-Dashboard {
                             <input type="text" 
                                    class="form-control" 
                                    name="search" 
-                                   placeholder="Search by asset number or host name..." 
+                                   placeholder="Search by asset number, host name or OS..." 
                                    value="$(Encode-HTML $searchTerm)">
                         </div>
                     </div>
@@ -431,9 +953,9 @@ function Render-Dashboard {
         </div>
 "@
 
-    # Build system details section if a system ID was requested
-    if ($systemId -gt 0) {
-        $detailsSection = Show-SystemDetails -systemId $systemId
+    # Build system details section if an asset number was requested
+    if (-not [string]::IsNullOrWhiteSpace($AssetNumber)) {
+        $detailsSection = Show-SystemDetails -AssetNumber $AssetNumber
         $backButton = @"
         <div class="mb-3">
             <a href="/?page=$page&search=$(Encode-HTML $searchTerm)" class="btn btn-outline-secondary">
@@ -443,10 +965,14 @@ function Render-Dashboard {
 "@
         # Combine all components for details view
         $output = $htmlHeader + $searchForm + $backButton + $detailsSection + $htmlFooter
+        
+        $duration = ((Get-Date) - $startTime).TotalMilliseconds
+        Log-Performance -operation "RenderDetails" -durationMs $duration -details "AssetNumber=$AssetNumber"
+        
         return $output
     }
 
-    # If no system ID, show the system list view
+    # If no asset number, show the system list view
     $systemData = Get-SystemRecords -searchTerm $searchTerm -page $page
     
     # Results count indicator
@@ -458,6 +984,16 @@ function Render-Dashboard {
                 $([math]::Min($page * $defaultRowCount, $systemData.TotalCount)) of 
                 $($systemData.TotalCount) systems
             </p>
+        </div>
+        <div class="col-auto">
+            <div class="btn-group">
+                <button class="btn btn-sm btn-outline-secondary" onclick="exportData('csv')">
+                    <i class="fas fa-file-csv me-1"></i>Export CSV
+                </button>
+                <button class="btn btn-sm btn-outline-secondary" onclick="exportData('json')">
+                    <i class="fas fa-file-code me-1"></i>Export JSON
+                </button>
+            </div>
         </div>
     </div>
 "@
@@ -479,12 +1015,12 @@ function Render-Dashboard {
                         <span class="badge bg-info">$([math]::Round($system.TotalRAMGB, 2)) GB RAM</span>
                     </div>
                     <p class="card-text">
-                        <i class="fas fa-windows me-2"></i>$(Encode-HTML $system.OSName)<br>
+                        <i class="fas fa-windows me-2"></i>$(Encode-HTML $system.OS)<br>
                         <small class="text-muted">Last scanned: $(Encode-HTML $system.ScanDate)</small>
                     </p>
                 </div>
                 <div class="card-footer bg-transparent">
-                    <a href="/?id=$($system.SystemID)&search=$(Encode-HTML $searchTerm)&page=$page" 
+                    <a href="/?AssetNumber=$(Encode-HTML $system.AssetNumber)&search=$(Encode-HTML $searchTerm)&page=$page" 
                        class="btn btn-sm btn-outline-primary">
                         <i class="fas fa-info-circle me-1"></i>Details
                     </a>
@@ -506,16 +1042,15 @@ function Render-Dashboard {
         $paginationBottom
 "@ + $htmlFooter
 
+    $duration = ((Get-Date) - $startTime).TotalMilliseconds
+    Log-Performance -operation "RenderList" -durationMs $duration -details "Page=$page, SearchTerm=$searchTerm"
+    
     return $output
 }
 
 <#
 .SYNOPSIS
     Encodes text for safe HTML output
-.DESCRIPTION
-    Prevents XSS by encoding special characters
-.PARAMETER text
-    The text to encode
 #>
 function Encode-HTML {
     param([string]$text)
@@ -545,17 +1080,52 @@ try {
                 if ($request.Url.Query) {
                     $request.Url.Query.TrimStart('?').Split('&') | ForEach-Object {
                         $key, $value = $_.Split('=', 2)
-                        $queryParams[$key] = [System.Uri]::UnescapeDataString($value)
+                        $queryParams[$key] = if ($value) { [System.Uri]::UnescapeDataString($value) } else { "" }
                     }
                 }
 
-                # Get parameters with defaults
+                # Handle export requests
+                if ($request.Url.LocalPath -eq "/export") {
+                    $startTime = Get-Date
+                    
+                    # Get parameters with defaults
+                    $searchTerm = $queryParams["search"] ?? ""
+                    $page = [int]($queryParams["page"] ?? 1)
+                    $AssetNumber = $queryParams["AssetNumber"] ?? ""
+                    $format = $queryParams["format"] ?? "csv"
+                    
+                    $exportData = Export-SystemData -searchTerm $searchTerm -page $page -AssetNumber $AssetNumber -format $format
+                    
+                    # Set appropriate content type and headers
+                    if ($format -eq "csv") {
+                        $response.ContentType = "text/csv"
+                        $filename = if ($AssetNumber) { "SystemDetails_$AssetNumber.csv" } else { "Systems_$page.csv" }
+                        $response.AddHeader("Content-Disposition", "attachment; filename=$filename")
+                    }
+                    else {
+                        $response.ContentType = "application/json"
+                        $filename = if ($AssetNumber) { "SystemDetails_$AssetNumber.json" } else { "Systems_$page.json" }
+                        $response.AddHeader("Content-Disposition", "attachment; filename=$filename")
+                    }
+                    
+                    $buffer = [System.Text.Encoding]::UTF8.GetBytes($exportData)
+                    $response.ContentLength64 = $buffer.Length
+                    $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                    $response.OutputStream.Close()
+                    
+                    $duration = ((Get-Date) - $startTime).TotalMilliseconds
+                    Log-Performance -operation "ExportData" -durationMs $duration -details "Format=$format, AssetNumber=$AssetNumber"
+                    
+                    continue
+                }
+
+                # Get parameters with defaults for regular requests
                 $searchTerm = $queryParams["search"] ?? ""
                 $page = [int]($queryParams["page"] ?? 1)
-                $systemId = [int]($queryParams["id"] ?? 0)
+                $AssetNumber = $queryParams["AssetNumber"] ?? ""
 
                 # Generate and send HTML response
-                $html = Render-Dashboard -searchTerm $searchTerm -page $page -systemId $systemId
+                $html = Render-Dashboard -searchTerm $searchTerm -page $page -AssetNumber $AssetNumber
                 $buffer = [System.Text.Encoding]::UTF8.GetBytes($html)
 
                 $response.ContentLength64 = $buffer.Length
@@ -590,6 +1160,8 @@ try {
                 $response.ContentType = "text/html; charset=utf-8"
                 $response.OutputStream.Write($buffer, 0, $buffer.Length)
                 $response.OutputStream.Close()
+                
+                Write-Host "Error processing request: $_" -ForegroundColor Red
             }
         }
         catch {
@@ -605,5 +1177,8 @@ finally {
     if ($listener.IsListening) {
         $listener.Stop()
     }
+    
+    # Log shutdown
+    Write-Host "Dashboard server stopped" -ForegroundColor Yellow
 }
 #endregion
