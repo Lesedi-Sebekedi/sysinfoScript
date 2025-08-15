@@ -97,14 +97,20 @@ Get-ChildItem -Path $FolderPath -Filter *.txt | ForEach-Object {
         $adapterBlocks = $networkContent -split "\r?\n\r?\n" | Where-Object { $_ -match "Adapter:" }
 
         foreach ($block in $adapterBlocks) {
+              # Extract DNS servers - handle multi-line case
+            $dnsServers = $null
+            if ($block -match "DNSServer: (.+?)(\r?\n|$)") {
+                $dnsServers = $matches[1].Trim() -split '\s*,\s*'
+            }
+            
             $adapter = @{
                 Name = ($block -match "Adapter: (.+?)\r?\n") ? $matches[1].Trim() : $null
                 IPAddress = ($block -match "IPAddress: (.+?)\r?\n") ? $matches[1].Trim() : $null
                 SubnetMask = ($block -match "SubnetMask: (.+?)\r?\n") ? $matches[1].Trim() : $null
                 DefaultGateway = ($block -match "DefaultGateway: (.+?)\r?\n") ? $matches[1].Trim() : $null
                 MacAddress = ($block -match "MacAddress: (.+?)\r?\n") ? $matches[1].Trim() : $null
-                DNSServers = ($block -match "DNSServer: (.+?)\r?\n") ? $matches[1].Trim() : $null
-                Speed = "N/A" # Not present in the text file
+                DNSServers = $dnsServers
+                Speed = "N/A"
             }
             $output.Network += $adapter
         }
