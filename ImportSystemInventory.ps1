@@ -199,10 +199,6 @@ VALUES (
 }
 
 function Import-Hardware {
-    <#
-    .SYNOPSIS
-        Imports hardware info into the database.
-    #>
     param(
         [Parameter(Mandatory)][string]$AssetNumber,
         [Parameter(Mandatory)][PSObject]$SystemData,
@@ -219,6 +215,27 @@ function Import-Hardware {
 
         $cmd = $Connection.CreateCommand()
         $cmd.Transaction = $Transaction
+        
+        # Handle GPU data (single object or array)
+        $gpuData = $SystemData.Hardware.GPU
+        $gpuName = $null
+        $gpuRam = 0
+        $gpuDriver = $null
+        
+        if ($gpuData -is [array]) {
+            # Take first GPU if multiple exist
+            $firstGpu = $gpuData[0]
+            $gpuName = $firstGpu.Name
+            $gpuRam = [decimal]$firstGpu.AdapterRAMGB
+            $gpuDriver = $firstGpu.DriverVersion
+        }
+        else {
+            # Single GPU object
+            $gpuName = $gpuData.Name
+            $gpuRam = [decimal]$gpuData.AdapterRAMGB
+            $gpuDriver = $gpuData.DriverVersion
+        }
+
         $cmd.CommandText = if ($hardwareId) {
 @"
 UPDATE Hardware SET
@@ -235,7 +252,7 @@ UPDATE Hardware SET
 WHERE AssetNumber=@AssetNumber
 "@
         } else {
-@"
+@" 
 INSERT INTO Hardware (
     AssetNumber, CPUName, CPUCores, CPUThreads, CPUClockSpeed,
     TotalRAMGB, PageFileGB, MemorySticks, GPUName, GPUAdapterRAMGB, GPUDriverVersion
@@ -255,12 +272,13 @@ INSERT INTO Hardware (
         Safe-AddSqlParameter -Command $cmd -Name "@TotalRAMGB"        -Value ([decimal]$SystemData.Hardware.Memory.TotalGB)      -Type ([System.Data.SqlDbType]::Decimal) -Precision 5 -Scale 2
         Safe-AddSqlParameter -Command $cmd -Name "@PageFileGB"        -Value ([decimal]$SystemData.Hardware.Memory.PageFileGB)   -Type ([System.Data.SqlDbType]::Decimal) -Precision 5 -Scale 2
         Safe-AddSqlParameter -Command $cmd -Name "@MemorySticks"      -Value $SystemData.Hardware.Memory.Sticks       -Type ([System.Data.SqlDbType]::Int)
-        Safe-AddSqlParameter -Command $cmd -Name "@GPUName"           -Value $SystemData.Hardware.GPU.Name            -Type ([System.Data.SqlDbType]::VarChar) -Size 100
-        Safe-AddSqlParameter -Command $cmd -Name "@GPUAdapterRAMGB"   -Value ([decimal]$SystemData.Hardware.GPU.AdapterRAMGB)    -Type ([System.Data.SqlDbType]::Decimal) -Precision 5 -Scale 2
-        Safe-AddSqlParameter -Command $cmd -Name "@GPUDriverVersion"  -Value $SystemData.Hardware.GPU.DriverVersion   -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+        Safe-AddSqlParameter -Command $cmd -Name "@GPUName"           -Value $gpuName            -Type ([System.Data.SqlDbType]::VarChar) -Size 100
+        Safe-AddSqlParameter -Command $cmd -Name "@GPUAdapterRAMGB"   -Value $gpuRam    -Type ([System.Data.SqlDbType]::Decimal) -Precision 5 -Scale 2
+        Safe-AddSqlParameter -Command $cmd -Name "@GPUDriverVersion"  -Value $gpuDriver   -Type ([System.Data.SqlDbType]::VarChar) -Size 50
 
         $cmd.ExecuteNonQuery() | Out-Null
 
+        # Rest of the function remains the same...
         # Ensure HardwareID for disks
         if (-not $hardwareId) {
             $getId = $Connection.CreateCommand()
