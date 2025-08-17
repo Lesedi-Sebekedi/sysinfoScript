@@ -2572,11 +2572,30 @@ function Read-FormData {
 	return $map
 }
 
+function Validate-AssetNumber {
+	param([Parameter(Mandatory)][string]$AssetNumber)
+	if ([string]::IsNullOrWhiteSpace($AssetNumber)) { throw [System.ArgumentException]::new("Asset number cannot be empty") }
+	if ($AssetNumber.Length -gt 50) { throw [System.ArgumentException]::new("Asset number cannot exceed 50 characters") }
+	$conn = $null
+	try {
+		$conn = Get-DatabaseConnection
+		$cmd = $conn.CreateCommand()
+		$cmd.CommandText = "SELECT 1 FROM Systems WHERE AssetNumber = @assetNumber"
+		$cmd.Parameters.AddWithValue("@assetNumber", $AssetNumber) | Out-Null
+		$exists = $cmd.ExecuteScalar()
+		if (-not $exists) { throw [System.ArgumentException]::new("Asset number $AssetNumber does not exist in Systems table") }
+	}
+	finally {
+		if ($conn) { Return-DatabaseConnection $conn }
+	}
+}
+
 function Save-AssetRegisterFromForm {
 	param([Parameter(Mandatory)][hashtable]$FormData)
 	if (-not $assetRegisterEnabled) { return $false }
 	Ensure-AssetRegisterSchema
 	$asset = $FormData["AssetNumber"]
+	Validate-AssetNumber -AssetNumber $asset
 	$locationId = $FormData["LocationID"]
 	$locationName = $FormData["LocationName"]
 	$custodian = $FormData["CurrentCustodian"]
