@@ -2411,7 +2411,6 @@ function Ensure-Location {
 }
 
 function Upsert-AssetRegister {
-	if (-not $assetRegisterEnabled) { return }
 	param(
 		[Parameter(Mandatory)][string]$AssetNumber,
 		[int]$CurrentLocationID,
@@ -2422,6 +2421,7 @@ function Upsert-AssetRegister {
 		[DateTime]$CheckOutDate,
 		[string]$Notes
 	)
+	if (-not $assetRegisterEnabled) { return }
 	try {
 		$conn = Get-DatabaseConnection
 		$existsCmd = $conn.CreateCommand()
