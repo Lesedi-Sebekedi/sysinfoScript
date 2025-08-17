@@ -328,7 +328,7 @@ ELSE
 		$cmd.ExecuteNonQuery() | Out-Null
 	}
 	catch {
-		Write-Warning "Asset register upsert during import failed for $AssetNumber: $_"
+		Write-Warning "Asset register upsert during import failed for ${AssetNumber}: $_"
 	}
 }
 

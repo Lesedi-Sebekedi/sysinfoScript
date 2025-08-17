@@ -2447,7 +2447,7 @@ VALUES (@a, @l, @c, @s, @w, @ci, @co, @n, GETDATE())
 		$null = $cmd.ExecuteNonQuery()
 	}
 	catch {
-		Write-Error "Failed to upsert AssetRegister for $AssetNumber: $_"
+		Write-Error "Failed to upsert AssetRegister for ${AssetNumber}: $_"
 	}
 	finally {
 		if ($conn) { Return-DatabaseConnection $conn }
@@ -2479,7 +2479,7 @@ VALUES (@a, @f, @t, @u, @act, @n)
 		$null = $cmd.ExecuteNonQuery()
 	}
 	catch {
-		Write-Warning "Failed to insert asset movement for $AssetNumber: $_"
+		Write-Warning "Failed to insert asset movement for ${AssetNumber}: $_"
 	}
 	finally {
 		if ($conn) { Return-DatabaseConnection $conn }
