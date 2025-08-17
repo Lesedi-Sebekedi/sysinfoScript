@@ -2468,8 +2468,8 @@ VALUES (@a, @l, @c, @s, @w, @ci, @co, @n, GETDATE())
 }
 
 function Add-AssetMovement {
-	if (-not $assetRegisterEnabled) { return }
 	param(
+
 		[Parameter(Mandatory)][string]$AssetNumber,
 		[int]$FromLocationID,
 		[int]$ToLocationID,
@@ -2507,6 +2507,7 @@ function Get-AssetRegisterRecords {
 		[int]$page = 1,
 		[int]$pageSize = $defaultRowCount
 	)
+	if (-not $assetRegisterEnabled) { return @{ Records = @(); TotalCount = 0 } }
 	try {
 		$offset = ($page - 1) * $pageSize
 		$conn = Get-DatabaseConnection
