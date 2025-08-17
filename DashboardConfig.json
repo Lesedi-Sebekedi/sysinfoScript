@@ -1,0 +1,16 @@
+{
+  "Port": 8081,
+  "DashboardTitle": "System Inventory Dashboard",
+  "CompanyName": "North West Provincial Treasury",
+  "DefaultRowCount": 20,
+  "ConnectionString": "Server=PTLSEBEKEDI;Database=AssetDB;Integrated Security=True;TrustServerCertificate=True",
+  "EnablePerformanceLogging": true,
+  "PerformanceLogPath": "%TEMP%\\DashboardPerformance.log",
+  "MaxConnections": 10,
+  "RateLimitPerMinute": 100,
+  "SessionTimeout": 30,
+  "CacheTimeout": 300,
+  "EnableHTTPS": false,
+  "CertificatePath": "",
+  "HealthCheckInterval": 60
+}

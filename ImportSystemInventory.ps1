@@ -1,25 +1,24 @@
 <#
 .SYNOPSIS
-    Imports system inventory data from JSON files to SQL Server using the new schema
+    Enhanced system inventory import script with improved network data handling
 .DESCRIPTION
-    Processes JSON inventory files and imports them into a SQL database.
-    Handles both new systems and updates to existing records.
+    Processes JSON inventory files and imports them into SQL database with:
+    - Better network data validation
+    - Duplicate data prevention
+    - Comprehensive error handling
 .COMPANY
     North West Provincial Treasury
 .AUTHOR
     Lesedi Sebekedi
 .VERSION
-    4.0
-.SECURITY
-    Requires SQL write permissions to the AssetDB database
-.PARAMETER ReportsFolder
-    Path to folder containing JSON files to import
-.PARAMETER ConnectionString
-    SQL Server connection string
+    4.1
 #>
 
 param(
+    [ValidateNotNullOrEmpty()]
     [string]$ReportsFolder = "$env:USERPROFILE\Desktop\SystemReports",
+    
+    [ValidateNotNullOrEmpty()]
     [string]$ConnectionString = "Server=PTLSEBEKEDI;Database=AssetDB;Integrated Security=True"
 )
 
@@ -114,6 +113,179 @@ function Get-SafeSqlDateTime {
     return (Get-SafeDateTime -DateString $DateString)
 }
 
+function Convert-CIDRToSubnetMask {
+    param([int]$CIDR)
+    
+    if ($CIDR -lt 0 -or $CIDR -gt 32) {
+        throw "CIDR must be between 0 and 32, got: $CIDR"
+    }
+    
+    try {
+        $mask = [System.Net.IPAddress]::Parse(([math]::Pow(2, 32) - [math]::Pow(2, (32 - $CIDR))).ToString())
+        return $mask
+    }
+    catch {
+        throw "Failed to convert CIDR $CIDR to subnet mask: $_"
+    }
+}
+
+function Test-ValidIPAddress {
+    param([string]$IPAddress)
+    
+    if ([string]::IsNullOrWhiteSpace($IPAddress)) { return $false }
+    return $IPAddress -match '^(\d{1,3}\.){3}\d{1,3}$'
+}
+
+function Test-JsonStructure {
+    param([Parameter(Mandatory)][PSObject]$JsonData)
+    
+    $errors = @()
+    
+    # Check required top-level sections
+    if (-not $JsonData.System) { $errors += "Missing 'System' section" }
+    if (-not $JsonData.Hardware) { $errors += "Missing 'Hardware' section" }
+    if (-not $JsonData.Network) { $errors += "Missing 'Network' section" }
+    if (-not $JsonData.Software) { $errors += "Missing 'Software' section" }
+    if (-not $JsonData.AssetNumber) { $errors += "Missing 'AssetNumber' field" }
+    
+    # Check System section
+    if ($JsonData.System) {
+        if (-not $JsonData.System.HostName) { $errors += "Missing 'System.HostName'" }
+        if (-not $JsonData.System.OS) { $errors += "Missing 'System.OS'" }
+        if (-not $JsonData.System.BIOS) { $errors += "Missing 'System.BIOS' section" }
+        if ($JsonData.System.BIOS -and -not $JsonData.System.BIOS.Serial) { $errors += "Missing 'System.BIOS.Serial'" }
+    }
+    
+    # Check Hardware section
+    if ($JsonData.Hardware) {
+        if (-not $JsonData.Hardware.CPU) { $errors += "Missing 'Hardware.CPU' section" }
+        if (-not $JsonData.Hardware.Memory) { $errors += "Missing 'Hardware.Memory' section" }
+        if ($JsonData.Hardware.CPU -and -not $JsonData.Hardware.CPU.Name) { $errors += "Missing 'Hardware.CPU.Name'" }
+        if ($JsonData.Hardware.Memory -and -not $JsonData.Hardware.Memory.TotalGB) { $errors += "Missing 'Hardware.Memory.TotalGB'" }
+    }
+    
+    # Check Network section
+    if ($JsonData.Network) {
+        if (-not $JsonData.Network.MacAddress) { $errors += "Missing 'Network.MacAddress'" }
+        if (-not $JsonData.Network.Name) { $errors += "Missing 'Network.Name'" }
+    }
+    
+    if ($errors.Count -gt 0) {
+        throw "JSON validation failed:`n" + ($errors -join "`n")
+    }
+    
+    return $true
+}
+
+function Test-DatabaseSchema {
+    param([Parameter(Mandatory)][System.Data.SqlClient.SqlConnection]$Connection)
+    
+    $errors = @()
+    
+    try {
+        # Test Systems table
+        $cmd = $Connection.CreateCommand()
+        $cmd.CommandText = @"
+SELECT COLUMN_NAME, DATA_TYPE 
+FROM INFORMATION_SCHEMA.COLUMNS 
+WHERE TABLE_NAME = 'Systems' 
+ORDER BY ORDINAL_POSITION
+"@
+        $result = $cmd.ExecuteReader()
+        $systemsColumns = @()
+        while ($result.Read()) {
+            $systemsColumns += $result["COLUMN_NAME"]
+        }
+        $result.Close()
+        
+        # Test Network table
+        $cmd.CommandText = @"
+SELECT COLUMN_NAME, DATA_TYPE 
+FROM INFORMATION_SCHEMA.COLUMNS 
+WHERE TABLE_NAME = 'Network' 
+ORDER BY ORDINAL_POSITION
+"@
+        $result = $cmd.ExecuteReader()
+        $networkColumns = @()
+        while ($result.Read()) {
+            $networkColumns += $result["COLUMN_NAME"]
+        }
+        $result.Close()
+        
+        # Test Hardware table
+        $cmd.CommandText = @"
+SELECT COLUMN_NAME, DATA_TYPE 
+FROM INFORMATION_SCHEMA.COLUMNS 
+WHERE TABLE_NAME = 'Hardware' 
+ORDER BY ORDINAL_POSITION
+"@
+        $result = $cmd.ExecuteReader()
+        $hardwareColumns = @()
+        while ($result.Read()) {
+            $hardwareColumns += $result["COLUMN_NAME"]
+        }
+        $result.Close()
+        
+        # Test Software table
+        $cmd.CommandText = @"
+SELECT COLUMN_NAME, DATA_TYPE 
+FROM INFORMATION_SCHEMA.COLUMNS 
+WHERE TABLE_NAME = 'Software' 
+ORDER BY ORDINAL_POSITION
+"@
+        $result = $cmd.ExecuteReader()
+        $softwareColumns = @()
+        while ($result.Read()) {
+            $softwareColumns += $result["COLUMN_NAME"]
+        }
+        $result.Close()
+        
+        Write-Host "Database Schema Information:" -ForegroundColor Cyan
+        Write-Host "Systems table columns: $($systemsColumns -join ', ')" -ForegroundColor DarkGray
+        Write-Host "Network table columns: $($networkColumns -join ', ')" -ForegroundColor DarkGray
+        Write-Host "Hardware table columns: $($hardwareColumns -join ', ')" -ForegroundColor DarkGray
+        Write-Host "Software table columns: $($softwareColumns -join ', ')" -ForegroundColor DarkGray
+        
+        # Store schema info in global variables for use in other functions
+        $script:DatabaseSchema = @{
+            Systems = $systemsColumns
+            Network = $networkColumns
+            Hardware = $hardwareColumns
+            Software = $softwareColumns
+        }
+        
+        return $true
+    }
+    catch {
+        Write-Warning "Could not retrieve database schema information: $_"
+        return $false
+    }
+}
+
+function Get-ColumnList {
+    param(
+        [Parameter(Mandatory)][string]$TableName,
+        [Parameter(Mandatory)][string[]]$RequiredColumns
+    )
+    
+    if (-not $script:DatabaseSchema -or -not $script:DatabaseSchema[$TableName]) {
+        return $RequiredColumns
+    }
+    
+    $availableColumns = $script:DatabaseSchema[$TableName]
+    $validColumns = @()
+    
+    foreach ($col in $RequiredColumns) {
+        if ($availableColumns -contains $col) {
+            $validColumns += $col
+        } else {
+            Write-Warning "Column '$col' not found in $TableName table, skipping..."
+        }
+    }
+    
+    return $validColumns
+}
+
 #endregion Helper Functions
 
 #region Import Functions
@@ -187,7 +359,7 @@ VALUES (
         Safe-AddSqlParameter -Command $cmd -Name "@BootTime"     -Value (Get-SafeDateTime $SystemData.System.BootTime) -Type ([System.Data.SqlDbType]::DateTime)
         Safe-AddSqlParameter -Command $cmd -Name "@BIOSVersion"  -Value $SystemData.System.BIOS.Version      -Type ([System.Data.SqlDbType]::VarChar) -Size 100
         Safe-AddSqlParameter -Command $cmd -Name "@ScanDate"     -Value ([DateTime]::UtcNow)                 -Type ([System.Data.SqlDbType]::DateTime)
-        Safe-AddSqlParameter -Command $cmd -Name "@PSVersion"    -Value $SystemData.PSVersion                -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+        Safe-AddSqlParameter -Command $cmd -Name "@PSVersion"    -Value ($SystemData.PSVersion ?? "Unknown") -Type ([System.Data.SqlDbType]::VarChar) -Size 50
 
         $cmd.ExecuteNonQuery() | Out-Null
         return $assetNumber
@@ -226,13 +398,27 @@ function Import-Hardware {
             # Take first GPU if multiple exist
             $firstGpu = $gpuData[0]
             $gpuName = $firstGpu.Name
-            $gpuRam = [decimal]$firstGpu.AdapterRAMGB
+            # Handle both AdapterRAM and AdapterRAMGB fields
+            if ($firstGpu.AdapterRAMGB) {
+                $gpuRam = [decimal]$firstGpu.AdapterRAMGB
+            } elseif ($firstGpu.AdapterRAM) {
+                $gpuRam = [decimal]($firstGpu.AdapterRAM / 1GB)
+            } else {
+                $gpuRam = 0
+            }
             $gpuDriver = $firstGpu.DriverVersion
         }
         else {
             # Single GPU object
             $gpuName = $gpuData.Name
-            $gpuRam = [decimal]$gpuData.AdapterRAMGB
+            # Handle both AdapterRAM and AdapterRAMGB fields
+            if ($gpuData.AdapterRAMGB) {
+                $gpuRam = [decimal]$gpuData.AdapterRAMGB
+            } elseif ($gpuData.AdapterRAM) {
+                $gpuRam = [decimal]($gpuData.AdapterRAM / 1GB)
+            } else {
+                $gpuRam = 0
+            }
             $gpuDriver = $gpuData.DriverVersion
         }
 
@@ -252,7 +438,7 @@ UPDATE Hardware SET
 WHERE AssetNumber=@AssetNumber
 "@
         } else {
-@" 
+@"
 INSERT INTO Hardware (
     AssetNumber, CPUName, CPUCores, CPUThreads, CPUClockSpeed,
     TotalRAMGB, PageFileGB, MemorySticks, GPUName, GPUAdapterRAMGB, GPUDriverVersion
@@ -278,7 +464,6 @@ INSERT INTO Hardware (
 
         $cmd.ExecuteNonQuery() | Out-Null
 
-        # Rest of the function remains the same...
         # Ensure HardwareID for disks
         if (-not $hardwareId) {
             $getId = $Connection.CreateCommand()
@@ -288,8 +473,13 @@ INSERT INTO Hardware (
             $hardwareId = [int]$getId.ExecuteScalar()
         }
 
-        if ($SystemData.Hardware.Disks) {
-            Import-Disks -HardwareId $hardwareId -Disks $SystemData.Hardware.Disks -Connection $Connection -Transaction $Transaction
+        # Handle Disks - convert single object to array if needed
+        $disks = $SystemData.Hardware.Disks
+        if ($disks) {
+            if ($disks -isnot [array]) {
+                $disks = @($disks)
+            }
+            Import-Disks -HardwareId $hardwareId -Disks $disks -Connection $Connection -Transaction $Transaction
         }
 
         return $hardwareId
@@ -379,33 +569,106 @@ function Import-Network {
     )
     
     try {
+        # Validate required network fields
+        if (-not $NetworkData.MacAddress) {
+            throw "Missing required MAC address in network data"
+        }
+
+        # Convert CIDR to subnet mask if needed
+        $subnetMask = if ($NetworkData.SubnetMask -match '^\d+$') {
+            try {
+                Convert-CIDRToSubnetMask -CIDR $NetworkData.SubnetMask
+            } catch {
+                Write-Warning "Invalid CIDR value: $($NetworkData.SubnetMask), using as-is"
+                $NetworkData.SubnetMask
+            }
+        } else {
+            $NetworkData.SubnetMask
+        }
+
+        # Validate IP configuration
+        $ipConfigType = if ($NetworkData.IPConfigType) {
+            $NetworkData.IPConfigType
+        } else {
+            if ($NetworkData.DHCPEnabled) { "DHCP" } else { "Static" }
+        }
+
+        # Check for existing network adapter by MAC address
+        $check = $Connection.CreateCommand()
+        $check.Transaction = $Transaction
+        $check.CommandText = "SELECT COUNT(*) FROM Network WHERE AssetNumber = @AssetNumber AND MacAddress = @MacAddress"
+        Safe-AddSqlParameter -Command $check -Name "@AssetNumber" -Value $AssetNumber -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+        Safe-AddSqlParameter -Command $check -Name "@MacAddress" -Value $NetworkData.MacAddress -Type ([System.Data.SqlDbType]::VarChar) -Size 20
+        $exists = [int]$check.ExecuteScalar() -gt 0
+
         $cmd = $Connection.CreateCommand()
         $cmd.Transaction = $Transaction
-        $cmd.CommandText = @"
+        $cmd.CommandText = if ($exists) {
+@"
+UPDATE Network SET
+    AdapterName = @AdapterName,
+    InterfaceDescription = @InterfaceDescription,
+    Speed = @Speed,
+    IPAddress = @IPAddress,
+    IPConfigType = @IPConfigType,
+    SubnetMask = @SubnetMask,
+    DefaultGateway = @DefaultGateway,
+    DNSServers = @DNSServers,
+    DHCPEnabled = @DHCPEnabled
+WHERE AssetNumber = @AssetNumber AND MacAddress = @MacAddress
+"@
+        } else {
+@"
 INSERT INTO Network (
-    AssetNumber, AdapterName, InterfaceDescription, MacAddress, 
-    Speed, IPAddress, DHCPEnabled
+    AssetNumber, AdapterName, InterfaceDescription, MacAddress,
+    Speed, IPAddress, IPConfigType, SubnetMask, DefaultGateway, DNSServers,
+    DHCPEnabled
 ) VALUES (
     @AssetNumber, @AdapterName, @InterfaceDescription, @MacAddress,
-    @Speed, @IPAddress, @DHCPEnabled
+    @Speed, @IPAddress, @IPConfigType, @SubnetMask, @DefaultGateway, @DNSServers,
+    @DHCPEnabled
 )
 "@
+        }
 
+        # Parameters with validation
         Safe-AddSqlParameter -Command $cmd -Name "@AssetNumber" -Value $AssetNumber -Type ([System.Data.SqlDbType]::VarChar) -Size 50
         Safe-AddSqlParameter -Command $cmd -Name "@AdapterName" -Value $NetworkData.Name -Type ([System.Data.SqlDbType]::VarChar) -Size 100
         Safe-AddSqlParameter -Command $cmd -Name "@InterfaceDescription" -Value $NetworkData.InterfaceDescription -Type ([System.Data.SqlDbType]::VarChar) -Size 255
         Safe-AddSqlParameter -Command $cmd -Name "@MacAddress" -Value $NetworkData.MacAddress -Type ([System.Data.SqlDbType]::VarChar) -Size 20
         Safe-AddSqlParameter -Command $cmd -Name "@Speed" -Value $NetworkData.Speed -Type ([System.Data.SqlDbType]::VarChar) -Size 20
         Safe-AddSqlParameter -Command $cmd -Name "@IPAddress" -Value $NetworkData.IPAddress -Type ([System.Data.SqlDbType]::VarChar) -Size 50
-        Safe-AddSqlParameter -Command $cmd -Name "@DHCPEnabled" -Value $false -Type ([System.Data.SqlDbType]::Bit) # Default value
+        Safe-AddSqlParameter -Command $cmd -Name "@IPConfigType" -Value $ipConfigType -Type ([System.Data.SqlDbType]::VarChar) -Size 20
+        Safe-AddSqlParameter -Command $cmd -Name "@SubnetMask" -Value $subnetMask -Type ([System.Data.SqlDbType]::VarChar) -Size 20
+        Safe-AddSqlParameter -Command $cmd -Name "@DefaultGateway" -Value $NetworkData.DefaultGateway -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+        Safe-AddSqlParameter -Command $cmd -Name "@DNSServers" -Value $NetworkData.DNSServers -Type ([System.Data.SqlDbType]::VarChar) -Size 255
+        
+        # Handle DHCPEnabled field - could be boolean or string
+        $dhcpEnabled = if ($NetworkData.DHCPEnabled -is [bool]) {
+            [int]$NetworkData.DHCPEnabled
+        } elseif ($NetworkData.DHCPEnabled -is [string]) {
+            [int](Convert-ToBool $NetworkData.DHCPEnabled)
+        } else {
+            0
+        }
+        Safe-AddSqlParameter -Command $cmd -Name "@DHCPEnabled" -Value $dhcpEnabled -Type ([System.Data.SqlDbType]::Bit)
 
-        $cmd.ExecuteNonQuery() | Out-Null
+        $rowsAffected = $cmd.ExecuteNonQuery()
+        
+        if ($rowsAffected -eq 0) {
+            Write-Warning "No rows were affected in Network table for asset $AssetNumber, MAC: $($NetworkData.MacAddress)"
+            # Don't throw an error, just log a warning
+        } else {
+            Write-Verbose "Successfully processed network adapter $($NetworkData.MacAddress) - $rowsAffected rows affected"
+        }
+
     }
     catch {
         Write-Error "Failed to import network information for asset ${AssetNumber}: $_"
         throw
     }
 }
+
 
 
 function Import-Software {
@@ -428,8 +691,8 @@ function Import-Software {
                 $check = $Connection.CreateCommand()
                 $check.Transaction = $Transaction
                 $check.CommandText = "SELECT COUNT(*) FROM Software WHERE AssetNumber=@AssetNumber AND AppName=@AppName AND IsApplication=1"
-                $check.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
-                $check.Parameters.AddWithValue("@AppName", $app.DisplayName) | Out-Null
+                Safe-AddSqlParameter -Command $check -Name "@AssetNumber" -Value $AssetNumber -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+                Safe-AddSqlParameter -Command $check -Name "@AppName" -Value $app.DisplayName -Type ([System.Data.SqlDbType]::VarChar) -Size 255
                 $exists = [int]$check.ExecuteScalar() -gt 0
 
                 $installDate = Get-SafeSqlDateTime -DateString $app.InstallDate
@@ -442,11 +705,11 @@ function Import-Software {
                     "INSERT INTO Software (AssetNumber, AppName, AppVersion, Publisher, InstallDate, IsApplication) VALUES (@AssetNumber, @AppName, @AppVersion, @Publisher, @InstallDate, 1)"
                 }
 
-                $cmd.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
-                $cmd.Parameters.AddWithValue("@AppName", $app.DisplayName) | Out-Null
-                $cmd.Parameters.AddWithValue("@AppVersion", ($app.DisplayVersion ?? [DBNull]::Value)) | Out-Null
-                $cmd.Parameters.AddWithValue("@Publisher", ($app.Publisher ?? [DBNull]::Value)) | Out-Null
-                $cmd.Parameters.AddWithValue("@InstallDate", $installDate) | Out-Null
+                Safe-AddSqlParameter -Command $cmd -Name "@AssetNumber" -Value $AssetNumber -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+                Safe-AddSqlParameter -Command $cmd -Name "@AppName" -Value $app.DisplayName -Type ([System.Data.SqlDbType]::VarChar) -Size 255
+                Safe-AddSqlParameter -Command $cmd -Name "@AppVersion" -Value ($app.DisplayVersion ?? [DBNull]::Value) -Type ([System.Data.SqlDbType]::VarChar) -Size 100
+                Safe-AddSqlParameter -Command $cmd -Name "@Publisher" -Value ($app.Publisher ?? [DBNull]::Value) -Type ([System.Data.SqlDbType]::VarChar) -Size 255
+                Safe-AddSqlParameter -Command $cmd -Name "@InstallDate" -Value $installDate -Type ([System.Data.SqlDbType]::DateTime)
 
                 $cmd.ExecuteNonQuery() | Out-Null
             }
@@ -460,8 +723,8 @@ function Import-Software {
                 $check = $Connection.CreateCommand()
                 $check.Transaction = $Transaction
                 $check.CommandText = "SELECT COUNT(*) FROM Software WHERE AssetNumber=@AssetNumber AND HotFixID=@HotFixID AND IsApplication=0"
-                $check.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
-                $check.Parameters.AddWithValue("@HotFixID", $hotfix.HotFixID) | Out-Null
+                Safe-AddSqlParameter -Command $check -Name "@AssetNumber" -Value $AssetNumber -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+                Safe-AddSqlParameter -Command $check -Name "@HotFixID" -Value $hotfix.HotFixID -Type ([System.Data.SqlDbType]::VarChar) -Size 50
                 $exists = [int]$check.ExecuteScalar() -gt 0
 
                 $installedDate =
@@ -477,10 +740,10 @@ function Import-Software {
                     "INSERT INTO Software (AssetNumber, HotFixID, HotFixDescription, HotFixInstalledDate, IsApplication) VALUES (@AssetNumber, @HotFixID, @HotFixDescription, @HotFixInstalledDate, 0)"
                 }
 
-                $cmd.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
-                $cmd.Parameters.AddWithValue("@HotFixID", $hotfix.HotFixID) | Out-Null
-                $cmd.Parameters.AddWithValue("@HotFixDescription", ($hotfix.Description ?? [DBNull]::Value)) | Out-Null
-                $cmd.Parameters.AddWithValue("@HotFixInstalledDate", $installedDate) | Out-Null
+                Safe-AddSqlParameter -Command $cmd -Name "@AssetNumber" -Value $AssetNumber -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+                Safe-AddSqlParameter -Command $cmd -Name "@HotFixID" -Value $hotfix.HotFixID -Type ([System.Data.SqlDbType]::VarChar) -Size 50
+                Safe-AddSqlParameter -Command $cmd -Name "@HotFixDescription" -Value ($hotfix.Description ?? [DBNull]::Value) -Type ([System.Data.SqlDbType]::VarChar) -Size 255
+                Safe-AddSqlParameter -Command $cmd -Name "@HotFixInstalledDate" -Value $installedDate -Type ([System.Data.SqlDbType]::DateTime)
 
                 $cmd.ExecuteNonQuery() | Out-Null
             }
@@ -560,6 +823,7 @@ try {
 
     foreach ($file in $jsonFiles) {
         Write-Host "`nProcessing $($file.Name)..." -ForegroundColor Cyan
+        Write-Host "File size: $([math]::Round($file.Length / 1KB, 2)) KB" -ForegroundColor DarkGray
 
         $conn = $null
         $tran = $null
@@ -567,21 +831,54 @@ try {
         $json = $null
 
         try {
-            # Load JSON data from file
+            Write-Host "  📖 Loading JSON data..." -ForegroundColor DarkYellow
             $json = Get-Content $file.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
 
-            # Set up database connection with transaction
+            Write-Host "  ✅ JSON loaded successfully" -ForegroundColor DarkGreen
+            Write-Host "  🔍 Validating JSON structure..." -ForegroundColor DarkYellow
+            
+            # Validate JSON structure before import
+            Test-JsonStructure -JsonData $json
+            Write-Host "  ✅ JSON validation passed" -ForegroundColor DarkGreen
+
+            Write-Host "  🗄️  Connecting to database..." -ForegroundColor DarkYellow
             $conn = New-Object System.Data.SqlClient.SqlConnection $ConnectionString
             $conn.Open()
             $tran = $conn.BeginTransaction()
+            Write-Host "  ✅ Database connected" -ForegroundColor DarkGreen
 
-            # Import all data
+            # Validate database schema
+            Write-Host "  🔍 Validating database schema..." -ForegroundColor DarkYellow
+            Test-DatabaseSchema -Connection $conn
+            Write-Host "  ✅ Database schema validated" -ForegroundColor DarkGreen
+
+            Write-Host "  📝 Importing system record..." -ForegroundColor DarkYellow
             $assetNumber = Import-SystemRecord -SystemData $json -Connection $conn -Transaction $tran
-            Import-Hardware -AssetNumber $assetNumber -SystemData $json -Connection $conn -Transaction $tran
-            Import-Network  -AssetNumber $assetNumber -NetworkData $json.Network   -Connection $conn -Transaction $tran
-            Import-Software -AssetNumber $assetNumber -SoftwareData $json.Software -Connection $conn -Transaction $tran
+            Write-Host "  ✅ System record imported: $assetNumber" -ForegroundColor DarkGreen
 
-            # Commit transaction if all operations succeeded
+            Write-Host "  🔧 Importing hardware information..." -ForegroundColor DarkYellow
+            Import-Hardware -AssetNumber $assetNumber -SystemData $json -Connection $conn -Transaction $tran
+            Write-Host "  ✅ Hardware information imported" -ForegroundColor DarkGreen
+            
+            Write-Host "  🌐 Importing network information..." -ForegroundColor DarkYellow
+            # Handle Network data - could be single object or array
+            $networkData = $json.Network
+            if ($networkData -is [array]) {
+                Write-Host "    📡 Processing $($networkData.Count) network adapters..." -ForegroundColor DarkCyan
+                foreach ($network in $networkData) {
+                    Import-Network -AssetNumber $assetNumber -NetworkData $network -Connection $conn -Transaction $tran
+                }
+            } else {
+                Write-Host "    📡 Processing single network adapter..." -ForegroundColor DarkCyan
+                Import-Network -AssetNumber $assetNumber -NetworkData $networkData -Connection $conn -Transaction $tran
+            }
+            Write-Host "  ✅ Network information imported" -ForegroundColor DarkGreen
+            
+            Write-Host "  💾 Importing software information..." -ForegroundColor DarkYellow
+            Import-Software -AssetNumber $assetNumber -SoftwareData $json.Software -Connection $conn -Transaction $tran
+            Write-Host "  ✅ Software information imported" -ForegroundColor DarkGreen
+
+            Write-Host "  💾 Committing transaction..." -ForegroundColor DarkYellow
             $tran.Commit()
             Write-Host "✅ Successfully imported $assetNumber" -ForegroundColor Green
 
@@ -590,22 +887,18 @@ try {
             $summary.SuccessAssets.Add($assetNumber)
         }
         catch {
-            # Rollback transaction on error
             if ($tran -and $tran.Connection -eq $conn) {
-                try { $tran.Rollback(); Write-Host "❌ Transaction rolled back for $($file.Name)" -ForegroundColor Red }
-                catch { Write-Host "❌ Failed to rollback transaction: $_" -ForegroundColor DarkRed }
+                try { $tran.Rollback() } catch { }
+                Write-Host "❌ Transaction rolled back for $($file.Name)" -ForegroundColor Red
             }
-
-            $errorMsg = "Error importing $($file.Name): $($_.Exception.Message)"
-            Write-Host "❌ $errorMsg" -ForegroundColor Red
-            Write-Host "Error details: $($_.ScriptStackTrace)" -ForegroundColor DarkYellow
+            Write-Host "❌ Error importing $($file.Name): $_" -ForegroundColor Red
 
             # Update failure summary
             $summary.FailedCount++
             $summary.FailedAssets.Add(@{
                 FileName    = $file.Name
                 AssetNumber = if ($assetNumber) { $assetNumber } else { try { $json.AssetNumber } catch { "N/A" } }
-                Error       = $errorMsg
+                Error       = $_.Exception.Message
             })
         }
         finally {
@@ -617,8 +910,7 @@ try {
     }
 }
 catch {
-    Write-Host "❌ Fatal error during import process: $($_.Exception.Message)" -ForegroundColor Red
-    $summary.FailedCount = $summary.TotalFiles
+    Write-Host "❌ Fatal error during import process: $_" -ForegroundColor Red
 }
 finally {
     $summary.EndTime = Get-Date

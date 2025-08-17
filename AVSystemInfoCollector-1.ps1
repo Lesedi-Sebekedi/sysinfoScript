@@ -2,54 +2,49 @@
 .SYNOPSIS
     Windows 7 System Information Collector with Enhanced Network Details
 .DESCRIPTION
-    Collects essential system information including DHCP/static IP configuration
-    Outputs to both TXT and JSON formats
+    Collects system and network information (DHCP/static IP details) 
+    and outputs the data in TXT and JSON-friendly structures.
 #>
 
-# Check if running on Windows 7
+# --- Validate OS Version ---
 if ((Get-WmiObject Win32_OperatingSystem).Version -notlike "6.1*") {
     Write-Host "This script is designed for Windows 7 only" -ForegroundColor Red
     exit 1
 }
 
+# --- Helpers ---
 function Convert-WmiDateTime {
     param([string]$wmiDate)
     if ([string]::IsNullOrEmpty($wmiDate)) { return "N/A" }
-    try {
-        return [Management.ManagementDateTimeConverter]::ToDateTime($wmiDate).ToString('yyyy-MM-dd HH:mm:ss')
-    } catch {
-        return "InvalidDate"
-    }
+    try   { [Management.ManagementDateTimeConverter]::ToDateTime($wmiDate).ToString('yyyy-MM-dd HH:mm:ss') }
+    catch { "InvalidDate" }
 }
 
+# --- Network Info ---
 function Get-NetworkConfiguration {
     try {
-        $networkAdapters = @()
+        $adapters = @()
         $nics = Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled }
 
         foreach ($nic in $nics) {
-            $ipConfigType = if ($nic.DHCPEnabled) { "DHCP" } else { "Static" }
-
-            $adapter = [PSCustomObject]@{
-                Name = $nic.Description
+            $adapters += [PSCustomObject]@{
+                Name              = $nic.Description
                 InterfaceDescription = $nic.Description
-                MacAddress = $nic.MACAddress
-                Speed = if ($nic.Speed) { "$([math]::Round($nic.Speed / 1MB, 2)) Mbps" } else { "N/A" }
-                IPAddress = if ($nic.IPAddress) { $nic.IPAddress[0] } else { "N/A" }
-                IPConfigType = $ipConfigType
-                SubnetMask = if ($nic.IPSubnet) { $nic.IPSubnet[0] } else { "N/A" }
-                DefaultGateway = if ($nic.DefaultIPGateway) { $nic.DefaultIPGateway[0] } else { "N/A" }
-                DNSServers = if ($nic.DNSServerSearchOrder) { $nic.DNSServerSearchOrder -join ", " } else { "N/A" }
-                DHCPEnabled = $nic.DHCPEnabled
-                DHCPServer = if ($nic.DHCPServer) { $nic.DHCPServer } else { "N/A" }
-                LeaseObtained = if ($nic.DHCPEnabled) { Convert-WmiDateTime $nic.DHCPLeaseObtained } else { "N/A" }
-                LeaseExpires = if ($nic.DHCPEnabled) { Convert-WmiDateTime $nic.DHCPLeaseExpires } else { "N/A" }
+                MacAddress        = $nic.MACAddress
+                Speed             = if ($nic.Speed) { "$([math]::Round($nic.Speed / 1MB, 2)) Mbps" } else { "N/A" }
+                IPAddress         = $nic.IPAddress[0]    ?? "N/A"
+                IPConfigType      = if ($nic.DHCPEnabled) { "DHCP" } else { "Static" }
+                SubnetMask        = $nic.IPSubnet[0]     ?? "N/A"
+                DefaultGateway    = $nic.DefaultIPGateway[0] ?? "N/A"
+                DNSServers        = ($nic.DNSServerSearchOrder -join ", ") ?? "N/A"
+                DHCPEnabled       = $nic.DHCPEnabled
+                DHCPServer        = $nic.DHCPServer      ?? "N/A"
+                LeaseObtained     = if ($nic.DHCPEnabled) { Convert-WmiDateTime $nic.DHCPLeaseObtained } else { "N/A" }
+                LeaseExpires      = if ($nic.DHCPEnabled) { Convert-WmiDateTime $nic.DHCPLeaseExpires  } else { "N/A" }
             }
-            $networkAdapters += $adapter
         }
 
-        if ($networkAdapters.Count -eq 1) { return $networkAdapters[0] }
-        return $networkAdapters
+        return ($adapters.Count -eq 1) ? $adapters[0] : $adapters
     }
     catch {
         Write-Warning "Error collecting network information: $_"
@@ -57,58 +52,65 @@ function Get-NetworkConfiguration {
     }
 }
 
+# --- System Info ---
 function Get-Win7SystemInfo {
     try {
-        # Basic System Information
-        $os = Get-WmiObject Win32_OperatingSystem
-        $computerSystem = Get-WmiObject Win32_ComputerSystem
-        $bios = Get-WmiObject Win32_BIOS
-        $systemProduct = Get-WmiObject Win32_ComputerSystemProduct
+        # Core details
+        $os         = Get-WmiObject Win32_OperatingSystem
+        $system     = Get-WmiObject Win32_ComputerSystem
+        $bios       = Get-WmiObject Win32_BIOS
+        $sysProduct = Get-WmiObject Win32_ComputerSystemProduct
 
-        # Hardware Information
-        $cpu = Get-WmiObject Win32_Processor | Select-Object -First 1 | Select-Object Name,
-            @{Name="Cores"; Expression={$_.NumberOfCores}},
-            @{Name="Threads"; Expression={$_.NumberOfLogicalProcessors}},
-            @{Name="ClockSpeed"; Expression={"$($_.MaxClockSpeed) MHz"}}
+        # CPU
+        $cpu = Get-WmiObject Win32_Processor | 
+               Select-Object -First 1 Name,
+                   @{Name="Cores";   Expression={$_.NumberOfCores}},
+                   @{Name="Threads"; Expression={$_.NumberOfLogicalProcessors}},
+                   @{Name="ClockSpeed"; Expression={"$($_.MaxClockSpeed) MHz"}}
 
-        $physicalMemory = Get-WmiObject Win32_PhysicalMemory | Measure-Object -Property Capacity -Sum
-        $memorySticks = Get-WmiObject Win32_PhysicalMemory
-        $pageFile = Get-WmiObject Win32_PageFileUsage | Select-Object @{Name="PageFileGB"; Expression={[math]::Round($_.AllocatedBaseSize / 1KB, 2)}}
-        
-        $disks = Get-WmiObject Win32_LogicalDisk | Where-Object { $_.DriveType -eq 3 } | Select-Object DeviceID, VolumeName,
-            @{Name="SizeGB"; Expression={[math]::Round($_.Size / 1GB, 2)}},
-            @{Name="FreeGB"; Expression={[math]::Round($_.FreeSpace / 1GB, 2)}},
-            @{Name="Type"; Expression={"Fixed"}}
+        # Memory
+        $physMem    = Get-WmiObject Win32_PhysicalMemory
+        $memTotal   = [math]::Round(($physMem | Measure-Object Capacity -Sum).Sum / 1GB, 2)
+        $pageFile   = Get-WmiObject Win32_PageFileUsage |
+                      Select-Object @{Name="PageFileGB"; Expression={[math]::Round($_.AllocatedBaseSize / 1KB, 2)}}
 
-        $gpu = Get-WmiObject Win32_VideoController | Select-Object Name,
-            @{Name="AdapterRAMGB"; Expression={[math]::Round($_.AdapterRAM / 1GB, 2)}},
-            DriverVersion
+        # Storage
+        $disks = Get-WmiObject Win32_LogicalDisk | Where-Object { $_.DriveType -eq 3 } |
+                 Select-Object DeviceID, VolumeName,
+                     @{Name="SizeGB"; Expression={[math]::Round($_.Size / 1GB, 2)}},
+                     @{Name="FreeGB"; Expression={[math]::Round($_.FreeSpace / 1GB, 2)}},
+                     @{Name="Type"; Expression={"Fixed"}}
 
-        # Network Information
-        $networkAdapters = Get-NetworkConfiguration
+        # GPU
+        $gpu = Get-WmiObject Win32_VideoController |
+               Select-Object Name,
+                   @{Name="AdapterRAMGB"; Expression={[math]::Round($_.AdapterRAM / 1GB, 2)}},
+                   DriverVersion
 
-        # Installed Software
-        $installedApps = @()
+        # Network
+        $netConfig = Get-NetworkConfiguration
+
+        # Software
+        $apps = @()
         $regPaths = @(
             "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
             "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
         )
-        
+
         foreach ($path in $regPaths) {
             if (Test-Path $path) {
-                $apps = Get-ItemProperty $path | Where-Object { $_.DisplayName -and -not $_.SystemComponent }
-                $installedApps += $apps | Select-Object DisplayName, DisplayVersion, Publisher, InstallDate
+                $apps += Get-ItemProperty $path | 
+                         Where-Object { $_.DisplayName -and -not $_.SystemComponent } |
+                         Select-Object DisplayName, DisplayVersion, Publisher, InstallDate
             }
         }
 
-        # Hotfixes
-        $hotfixes = @()
-        if (Get-Command Get-HotFix -ErrorAction SilentlyContinue) {
-            $hotfixes = Get-HotFix -ErrorAction SilentlyContinue | Select-Object HotFixID, Description, InstalledOn
+        $hotfixes = if (Get-Command Get-HotFix -ErrorAction SilentlyContinue) {
+            Get-HotFix | Select-Object HotFixID, Description, InstalledOn
         }
 
-        # Build output object matching SystemInfoCollector's structure
-        return [PSCustomObject]@{
+        # Output object
+        [PSCustomObject]@{
             System = @{
                 HostName     = $env:COMPUTERNAME
                 OS           = $os.Caption
@@ -116,8 +118,8 @@ function Get-Win7SystemInfo {
                 Build        = $os.BuildNumber
                 Architecture = if ([IntPtr]::Size -eq 8) { "64-bit" } else { "32-bit" }
                 BootTime     = Convert-WmiDateTime $os.LastBootUpTime
-                Manufacturer = $computerSystem.Manufacturer
-                Model        = $computerSystem.Model
+                Manufacturer = $system.Manufacturer
+                Model        = $system.Model
                 BIOS         = @{
                     Version = $bios.SMBIOSBIOSVersion
                     Serial  = $bios.SerialNumber
@@ -126,35 +128,34 @@ function Get-Win7SystemInfo {
             Hardware = @{
                 CPU    = $cpu
                 Memory = @{
-                    TotalGB    = [math]::Round($physicalMemory.Sum / 1GB, 2)
-                    Sticks     = $memorySticks.Count
-                    PageFileGB = if ($pageFile) { $pageFile.PageFileGB } else { 0 }
+                    TotalGB    = $memTotal
+                    Sticks     = $physMem.Count
+                    PageFileGB = $pageFile.PageFileGB ?? 0
                 }
                 Disks  = $disks
                 GPU    = $gpu
             }
-            Network = $networkAdapters
-            Software = @{
-                InstalledApps = $installedApps
-                Hotfixes     = $hotfixes
+            Network   = $netConfig
+            Software  = @{
+                InstalledApps = $apps
+                Hotfixes      = $hotfixes
             }
-            UUID       = $systemProduct.UUID
-            PSVersion  = $PSVersionTable.PSVersion.ToString()
-            Timestamp  = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+            UUID      = $sysProduct.UUID
+            PSVersion = $PSVersionTable.PSVersion.ToString()
+            Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
         }
-    } catch {
+    }
+    catch {
         Write-Warning "Error collecting system information: $_"
         return $null
     }
 }
 
+# --- Text Report Formatter ---
 function ConvertTo-TextReport {
-    param(
-        [Parameter(Mandatory=$true)]
-        $SystemInfo
-    )
-    
-    $report = @"
+    param([Parameter(Mandatory=$true)] $SystemInfo)
+
+    @"
 === SYSTEM INFORMATION REPORT ===
 Generated: $($SystemInfo.Timestamp)
 
@@ -188,25 +189,27 @@ Driver: $($SystemInfo.Hardware.GPU.DriverVersion)
 
 --- NETWORK ---
 $($SystemInfo.Network | ForEach-Object {
-    if ($_.Name) {
-        "Adapter: $($_.Name)`r`n"
-        "IPAddress: $($_.IPAddress)`r`n"
-        "SubnetMask: $($_.SubnetMask)`r`n"
-        "DefaultGateway: $($_.DefaultGateway)`r`n"
-        "MacAddress: $($_.MacAddress)`r`n"
-        "DNSServer: $($_.DNSServers)`r`n"
-    }
+    @"
+Adapter: $($_.Name)
+IPAddress: $($_.IPAddress)
+SubnetMask: $($_.SubnetMask)
+DefaultGateway: $($_.DefaultGateway)
+MacAddress: $($_.MacAddress)
+DNSServer: $($_.DNSServers)
+IP Configuration: $($_.IPConfigType)
+DHCP Server: $($_.DHCPServer)
+"@
 })
 
 --- SOFTWARE ---
 Installed Applications:
 $($SystemInfo.Software.InstalledApps | ForEach-Object {
-    "  $($_.DisplayName) ($($_.DisplayVersion)) by $($_.Publisher)`r`n"
+    "  $($_.DisplayName) ($($_.DisplayVersion)) by $($_.Publisher)"
 })
 
 Hotfixes:
 $($SystemInfo.Software.Hotfixes | ForEach-Object {
-    "  $($_.HotFixID) - $($_.Description) (Installed: $($_.InstalledOn))`r`n"
+    "  $($_.HotFixID) - $($_.Description) (Installed: $($_.InstalledOn))"
 })
 
 --- SYSTEM IDENTIFIERS ---
@@ -216,50 +219,38 @@ BIOS Serial: $($SystemInfo.System.BIOS.Serial)
 
 Report generated with PowerShell $($SystemInfo.PSVersion)
 "@
-
-    return $report
 }
 
-# Main Execution
+# --- Main Execution ---
 Write-Host "Windows 7 System Information Collector" -ForegroundColor Cyan
 Write-Host "------------------------------------" -ForegroundColor Cyan
 
-# Asset number input with validation
+# Asset Number
 do {
     $assetNumber = Read-Host "Enter Asset Number (11 digits starting with 0)"
-} while (-not ($assetNumber -match '^0\d{10}$'))
+} while ($assetNumber -notmatch '^0\d{10}$')
 
-# Collect system info
-$systemInfo = Get-Win7SystemInfo
-
-if ($systemInfo -ne $null) {
-    # Add asset number property
-    $systemInfo | Add-Member -MemberType NoteProperty -Name "AssetNumber" -Value $assetNumber -Force
-
-    # Create output directory
-    $outputDir = "$env:USERPROFILE\Desktop\SystemReports"
-    if (-not (Test-Path $outputDir)) {
-        try {
-            New-Item -ItemType Directory -Path $outputDir -ErrorAction Stop | Out-Null
-        } catch {
-            Write-Warning "Failed to create directory: $outputDir. $_"
-            exit 1
-        }
-    }
-
-    $timestampSafe = (Get-Date).ToString('yyyyMMdd_HHmmss')
-    $computerName = $env:COMPUTERNAME -replace '[\\/:*?"<>|]', '_'
-
-    # Generate and save TXT report
-    $txtReport = ConvertTo-TextReport -SystemInfo $systemInfo
-    $txtFile = Join-Path $outputDir "${computerName}_SystemInfo_${timestampSafe}.txt"
-    $txtReport | Out-File -FilePath $txtFile -Encoding UTF8
-    Write-Host "`nText report saved to: $txtFile" -ForegroundColor Green
-
-    # Display report in console
-    Write-Host "`n=== SYSTEM INFORMATION SUMMARY ===`n"
-    Write-Host $txtReport
-}
-else {
+# Collect Info
+$sysInfo = Get-Win7SystemInfo
+if (-not $sysInfo) {
     Write-Host "Failed to collect system information" -ForegroundColor Red
+    exit 1
 }
+
+# Attach Asset Number
+$sysInfo | Add-Member -NotePropertyName "AssetNumber" -NotePropertyValue $assetNumber -Force
+
+# Prepare Output Dir
+$outputDir = "$env:USERPROFILE\Desktop\SystemReports"
+if (-not (Test-Path $outputDir)) { New-Item -ItemType Directory -Path $outputDir -Force | Out-Null }
+
+# Save Report
+$timestamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
+$pcName    = $env:COMPUTERNAME -replace '[\\/:*?"<>|]', '_'
+
+$txtFile   = Join-Path $outputDir "${pcName}_SystemInfo_${timestamp}.txt"
+ConvertTo-TextReport $sysInfo | Out-File $txtFile -Encoding UTF8
+
+Write-Host "`nText report saved to: $txtFile" -ForegroundColor Green
+Write-Host "`n=== SYSTEM INFORMATION SUMMARY ===`n"
+Write-Host (ConvertTo-TextReport $sysInfo)

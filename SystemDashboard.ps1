@@ -11,21 +11,98 @@
     - Secure HTML rendering
     - Performance monitoring
     - Export capabilities
+    - Connection pooling and caching
+    - Rate limiting and health monitoring
 .NOTES
     Author: Lesedi Sebekedi
-    Version: 2.0
+    Version: 3.0
     Last Updated: $(Get-Date -Format "yyyy-MM-dd")
 #>
 
 #region CONFIGURATION
-# Dashboard settings
-$port = 8080  # Web server listening port
-$dashboardTitle = "System Inventory Dashboard"
-$companyName = "North West Provincial Treasury"
-$defaultRowCount = 20  # Number of items per page
-$connectionString = "Server=PTLSEBEKEDI;Database=AssetDB;Integrated Security=True;TrustServerCertificate=True"
-$enablePerformanceLogging = $true
-$performanceLogPath = "$env:TEMP\DashboardPerformance.log"
+# Load or create configuration file
+$configPath = Join-Path $PSScriptRoot "DashboardConfig.json"
+$defaultConfig = @{
+    Port = 8080
+    DashboardTitle = "System Inventory Dashboard"
+    CompanyName = "North West Provincial Treasury"
+    DefaultRowCount = 20
+    ConnectionString = "Server=PTLSEBEKEDI;Database=AssetDB;Integrated Security=True;TrustServerCertificate=True"
+    EnablePerformanceLogging = $true
+    PerformanceLogPath = "$env:TEMP\DashboardPerformance.log"
+    MaxConnections = 10
+    RateLimitPerMinute = 100
+    SessionTimeout = 30
+    CacheTimeout = 300
+    EnableHTTPS = $false
+    CertificatePath = ""
+    HealthCheckInterval = 60
+}
+
+# Load or create configuration
+if (Test-Path $configPath) {
+    try {
+        $config = Get-Content $configPath | ConvertFrom-Json
+        Write-Host "Configuration loaded from: $configPath" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Failed to load configuration, using defaults: $_"
+        $config = $defaultConfig
+    }
+} else {
+    try {
+        $defaultConfig | ConvertTo-Json -Depth 3 | Set-Content $configPath
+        $config = $defaultConfig
+        Write-Host "Default configuration created at: $configPath" -ForegroundColor Yellow
+    }
+    catch {
+        Write-Warning "Failed to create configuration file, using defaults: $_"
+        $config = $defaultConfig
+    }
+}
+
+# Dashboard settings from config
+$port = $config.Port
+$dashboardTitle = $config.DashboardTitle
+$companyName = $config.CompanyName
+$defaultRowCount = $config.DefaultRowCount
+$connectionString = $config.ConnectionString
+$enablePerformanceLogging = $config.EnablePerformanceLogging
+$performanceLogPath = $config.PerformanceLogPath
+#endregion
+
+#region GLOBAL VARIABLES AND STATE
+# Connection pool management
+$script:connectionPool = @{
+    Connections = [System.Collections.Queue]::new()
+    MaxConnections = $config.MaxConnections
+    Lock = [System.Threading.ReaderWriterLockSlim]::new()
+    ActiveConnections = 0
+}
+
+# Rate limiting
+$script:requestCounts = @{}
+$script:rateLimitWindow = 60  # seconds
+$script:maxRequestsPerWindow = $config.RateLimitPerMinute
+
+# Caching system
+$script:cache = @{}
+$script:cacheTimeout = $config.CacheTimeout
+
+# Health monitoring
+$script:startTime = Get-Date
+$script:lastHealthCheck = Get-Date
+$script:healthStatus = "Healthy"
+$script:lastError = $null
+
+# Performance tracking
+$script:requestStats = @{
+    TotalRequests = 0
+    SuccessfulRequests = 0
+    FailedRequests = 0
+    AverageResponseTime = 0
+    LastReset = Get-Date
+}
 #endregion
 
 # Load required SQL module
@@ -33,10 +110,324 @@ try {
     Import-Module SqlServer -ErrorAction Stop
 }
 catch {
-    Write-Host "SQL Server module not found. Installing..."
+    Write-Host "SQL Server module not found. Installing..." -ForegroundColor Yellow
     Install-Module -Name SqlServer -Force -AllowClobber -Scope CurrentUser
     Import-Module SqlServer
 }
+
+#region UTILITY FUNCTIONS
+
+<#
+.SYNOPSIS
+    Gets a database connection from the pool or creates a new one
+#>
+function Get-DatabaseConnection {
+    try {
+        $script:connectionPool.Lock.EnterReadLock()
+        
+        # Try to get connection from pool
+        if ($script:connectionPool.Connections.Count -gt 0) {
+            $conn = $script:connectionPool.Connections.Dequeue()
+            $script:connectionPool.ActiveConnections++
+            
+            # Test if connection is still valid
+            if ($conn.State -eq [System.Data.ConnectionState]::Open) {
+                return $conn
+            } else {
+                $conn.Dispose()
+                $script:connectionPool.ActiveConnections--
+            }
+        }
+    }
+    finally {
+        $script:connectionPool.Lock.ExitReadLock()
+    }
+    
+    # Create new connection if pool is empty or all connections are busy
+    try {
+        $script:connectionPool.Lock.EnterWriteLock()
+        
+        if ($script:connectionPool.ActiveConnections -lt $script:connectionPool.MaxConnections) {
+            $conn = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+            $conn.Open()
+            $script:connectionPool.ActiveConnections++
+            return $conn
+        }
+    }
+    finally {
+        $script:connectionPool.Lock.ExitWriteLock()
+    }
+    
+    # If we can't get a connection, wait and retry
+    Start-Sleep -Milliseconds 100
+    return Get-DatabaseConnection
+}
+
+<#
+.SYNOPSIS
+    Returns a database connection to the pool
+#>
+function Return-DatabaseConnection {
+    param([System.Data.SqlClient.SqlConnection]$Connection)
+    
+    if (-not $Connection) { return }
+    
+    try {
+        $script:connectionPool.Lock.EnterWriteLock()
+        
+        if ($script:connectionPool.Connections.Count -lt $script:connectionPool.MaxConnections) {
+            $script:connectionPool.Connections.Enqueue($Connection)
+        } else {
+            $Connection.Dispose()
+        }
+        
+        $script:connectionPool.ActiveConnections--
+    }
+    finally {
+        $script:connectionPool.Lock.ExitWriteLock()
+    }
+}
+
+<#
+.SYNOPSIS
+    Tests rate limiting for a client IP
+#>
+function Test-RateLimit {
+    param([string]$ClientIP)
+    
+    $now = Get-Date
+    $windowStart = $now.AddSeconds(-$script:rateLimitWindow)
+    
+    # Clean old entries
+    $script:requestCounts.Keys | Where-Object { $script:requestCounts[$_].LastRequest -lt $windowStart } | ForEach-Object {
+        $script:requestCounts.Remove($_)
+    }
+    
+    # Check if client exists and is within limits
+    if (-not $script:requestCounts.ContainsKey($ClientIP)) {
+        $script:requestCounts[$ClientIP] = @{
+            Count = 1
+            LastRequest = $now
+        }
+        return $true
+    }
+    
+    $client = $script:requestCounts[$ClientIP]
+    if ($client.Count -ge $script:maxRequestsPerWindow) {
+        return $false
+    }
+    
+    $client.Count++
+    $client.LastRequest = $now
+    return $true
+}
+
+<#
+.SYNOPSIS
+    Gets cached data if available and not expired
+#>
+function Get-CachedData {
+    param([string]$Key)
+    
+    if ($script:cache.ContainsKey($Key)) {
+        $cached = $script:cache[$Key]
+        if ((Get-Date) - $cached.Timestamp -lt [TimeSpan]::FromSeconds($script:cacheTimeout)) {
+            return $cached.Data
+        } else {
+            $script:cache.Remove($Key)
+        }
+    }
+    return $null
+}
+
+<#
+.SYNOPSIS
+    Sets data in cache with timestamp
+#>
+function Set-CachedData {
+    param(
+        [string]$Key,
+        [object]$Data
+    )
+    
+    $script:cache[$Key] = @{
+        Data = $Data
+        Timestamp = Get-Date
+    }
+    
+    # Clean up old cache entries if cache gets too large
+    if ($script:cache.Count -gt 100) {
+        $oldestKeys = $script:cache.Keys | Sort-Object { $script:cache[$_].Timestamp } | Select-Object -First 20
+        foreach ($key in $oldestKeys) {
+            $script:cache.Remove($key)
+        }
+    }
+}
+
+<#
+.SYNOPSIS
+    Gets system health status
+#>
+function Get-SystemHealth {
+    $health = @{
+        Status = $script:healthStatus
+        DatabaseConnection = $false
+        ActiveConnections = $script:connectionPool.ActiveConnections
+        PoolSize = $script:connectionPool.Connections.Count
+        MaxConnections = $script:connectionPool.MaxConnections
+        MemoryUsage = [math]::Round((Get-Process -Id $PID).WorkingSet64 / 1MB, 2)
+        Uptime = (Get-Date) - $script:startTime
+        LastError = $script:lastError
+        CacheSize = $script:cache.Count
+        RequestStats = $script:requestStats
+        RateLimitStatus = @{
+            ActiveClients = $script:requestCounts.Count
+            MaxRequestsPerWindow = $script:maxRequestsPerWindow
+        }
+    }
+    
+    # Test database connection
+    try {
+        $conn = Get-DatabaseConnection
+        $conn.Close()
+        Return-DatabaseConnection $conn
+        $health.DatabaseConnection = $true
+    }
+    catch {
+        $script:healthStatus = "Degraded"
+        $script:lastError = $_.Exception.Message
+        $health.Status = $script:healthStatus
+        $health.LastError = $script:lastError
+    }
+    
+    return $health
+}
+
+<#
+.SYNOPSIS
+    Enhanced error handling with logging and user-friendly messages
+#>
+function Handle-Error {
+    param(
+        [string]$Operation,
+        [System.Exception]$Exception,
+        [string]$UserContext = "",
+        [string]$RequestPath = ""
+    )
+    
+    # Log error details
+    $errorDetails = @{
+        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Operation = $Operation
+        Context = $UserContext
+        RequestPath = $RequestPath
+        ErrorMessage = $Exception.Message
+        ErrorType = $Exception.GetType().Name
+        StackTrace = $Exception.StackTrace
+    }
+    
+    Write-Error "Operation: $Operation, Context: $UserContext, Error: $($Exception.Message)"
+    
+    # Log to performance log if enabled
+    if ($enablePerformanceLogging) {
+        try {
+            $errorDetails | ConvertTo-Json -Compress | Add-Content -Path $performanceLogPath -ErrorAction SilentlyContinue
+        }
+        catch {
+            Write-Warning "Failed to write error to performance log: $_"
+        }
+    }
+    
+    # Update health status
+    $script:lastError = $Exception.Message
+    $script:requestStats.FailedRequests++
+    
+    # Return user-friendly error message
+    return @"
+    <div class="alert alert-danger">
+        <h4><i class="fas fa-exclamation-triangle me-2"></i>Operation Failed</h4>
+        <p>We encountered an issue while $Operation. Please try again later.</p>
+        <hr>
+        <small class="text-muted">
+            <strong>Error ID:</strong> $(New-Guid)<br>
+            <strong>Time:</strong> $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")<br>
+            <strong>Operation:</strong> $Operation
+        </small>
+    </div>
+"@
+}
+
+<#
+.SYNOPSIS
+    Updates request statistics
+#>
+function Update-RequestStats {
+    param(
+        [bool]$Success,
+        [double]$ResponseTime
+    )
+    
+    $script:requestStats.TotalRequests++
+    
+    if ($Success) {
+        $script:requestStats.SuccessfulRequests++
+    } else {
+        $script:requestStats.FailedRequests++
+    }
+    
+    # Update average response time
+    $currentAvg = $script:requestStats.AverageResponseTime
+    $totalRequests = $script:requestStats.TotalRequests
+    $script:requestStats.AverageResponseTime = (($currentAvg * ($totalRequests - 1)) + $ResponseTime) / $totalRequests
+    
+    # Reset stats every hour
+    if ((Get-Date) - $script:requestStats.LastReset -gt [TimeSpan]::FromHours(1)) {
+        $script:requestStats.TotalRequests = 0
+        $script:requestStats.SuccessfulRequests = 0
+        $script:requestStats.FailedRequests = 0
+        $script:requestStats.AverageResponseTime = 0
+        $script:requestStats.LastReset = Get-Date
+    }
+}
+
+<#
+.SYNOPSIS
+    Performs periodic health checks
+#>
+function Start-HealthMonitoring {
+    $healthCheckJob = Start-Job -ScriptBlock {
+        param($ConfigPath, $HealthCheckInterval)
+        
+        while ($true) {
+            try {
+                # Load config and check health
+                $config = Get-Content $ConfigPath | ConvertFrom-Json
+                $health = Get-SystemHealth
+                
+                # Log health status
+                $logEntry = @{
+                    Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    HealthStatus = $health.Status
+                    DatabaseConnection = $health.DatabaseConnection
+                    ActiveConnections = $health.ActiveConnections
+                    MemoryUsage = $health.MemoryUsage
+                    Uptime = $health.Uptime.ToString()
+                } | ConvertTo-Json -Compress
+                
+                Add-Content -Path "$env:TEMP\DashboardHealth.log" -Value $logEntry -ErrorAction SilentlyContinue
+                
+                Start-Sleep -Seconds $HealthCheckInterval
+            }
+            catch {
+                Start-Sleep -Seconds $HealthCheckInterval
+            }
+        }
+    } -ArgumentList $configPath, $config.HealthCheckInterval
+    
+    return $healthCheckJob
+}
+
+#endregion
 
 #region HTML TEMPLATES
 # Main HTML structure with embedded CSS and JavaScript
@@ -51,6 +442,8 @@ $htmlHeader = @"
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css">
+    <!-- Chart.js for analytics -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         /* Custom styling for dashboard elements */
         .system-card:hover {
@@ -102,18 +495,46 @@ $htmlHeader = @"
         .export-btn {
             margin-left: 10px;
         }
+        .health-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+        }
+        .health-healthy { background-color: #28a745; }
+        .health-degraded { background-color: #ffc107; }
+        .health-unhealthy { background-color: #dc3545; }
+        .stats-card {
+            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+            border: 1px solid #dee2e6;
+        }
     </style>
 </head>
 <body>
-    <!-- Navigation header with live clock -->
+    <!-- Navigation header with live clock and health status -->
     <nav class="navbar navbar-expand-lg navbar-dark logo-header mb-4">
         <div class="container-fluid">
             <a class="navbar-brand" href="#">
                 <i class="fas fa-server me-2"></i>$dashboardTitle
             </a>
-            <div class="navbar-text ms-auto">
-                <i class="fas fa-clock me-1"></i>
-                <span id="live-clock"></span>
+            <div class="navbar-nav me-auto">
+                <a class="nav-link" href="/">
+                    <i class="fas fa-list me-1"></i>Systems
+                </a>
+                <a class="nav-link" href="/analytics">
+                    <i class="fas fa-chart-line me-1"></i>Analytics
+                </a>
+            </div>
+            <div class="navbar-text ms-auto d-flex align-items-center">
+                <div class="me-3">
+                    <span class="health-indicator health-healthy" id="health-indicator"></span>
+                    <span id="health-status">Healthy</span>
+                </div>
+                <div class="me-3">
+                    <i class="fas fa-clock me-1"></i>
+                    <span id="live-clock"></span>
+                </div>
             </div>
         </div>
     </nav>
@@ -142,6 +563,32 @@ $htmlFooter = @"
         }
         updateClock();
         
+        // Health status update function
+        function updateHealthStatus() {
+            fetch('/health')
+                .then(response => response.json())
+                .then(data => {
+                    const indicator = document.getElementById('health-indicator');
+                    const status = document.getElementById('health-status');
+                    
+                    // Update health indicator
+                    indicator.className = 'health-indicator health-' + data.Status.toLowerCase();
+                    
+                    // Update status text
+                    status.textContent = data.Status;
+                    
+                    // Update last updated timestamp
+                    document.getElementById('last-updated').textContent = new Date().toLocaleString();
+                })
+                .catch(error => {
+                    console.log('Health check failed:', error);
+                });
+        }
+        
+        // Update health status every 30 seconds
+        setInterval(updateHealthStatus, 30000);
+        updateHealthStatus();
+        
         // Auto-refresh every 5 minutes (300,000 ms)
         setTimeout(function() {
             window.location.reload();
@@ -164,9 +611,9 @@ $htmlFooter = @"
             const page = searchParams.get('page') || 1;
             
             if (assetNumber) {
-                window.location.href = `/export?AssetNumber=${assetNumber}&format=${format}`;
+                window.location.href = `/export?AssetNumber=`${assetNumber}`&format=`${format}``;
             } else {
-                window.location.href = `/export?search=${searchTerm}&page=${page}&format=${format}`;
+                window.location.href = `/export?search=`${searchTerm}`&page=`${page}`&format=`${format}``;
             }
         }
     </script>
@@ -193,9 +640,8 @@ function Get-SystemRecords {
     try {
         $offset = ($page - 1) * $pageSize
         
-        # Create connection and command objects
-        $conn = New-Object System.Data.SqlClient.SqlConnection($connectionString)
-        $conn.Open()
+        # Create connection and command objects using connection pool
+        $conn = Get-DatabaseConnection
         
         # Validate sort column to prevent SQL injection
         $validColumns = @("AssetNumber", "HostName", "OS", "TotalRAMGB", "ScanDate")
@@ -247,7 +693,7 @@ function Get-SystemRecords {
         $adapter.Fill($dataset) | Out-Null
         
         $results = $dataset.Tables[0]
-        $conn.Close()
+        Return-DatabaseConnection $conn
 
         return @{
             Records = $results | Select-Object AssetNumber, HostName, OS, TotalRAMGB, ScanDate
@@ -255,6 +701,7 @@ function Get-SystemRecords {
         }
     }
     catch {
+        if ($conn) { Return-DatabaseConnection $conn }
         Write-Error "Database query failed: $_"
         return @{ Records = @(); TotalCount = 0 }
     }
@@ -268,9 +715,8 @@ function Show-SystemDetails {
     param($AssetNumber)
     
     try {
-        # Create connection
-        $conn = New-Object System.Data.SqlClient.SqlConnection($connectionString)
-        $conn.Open()
+        # Create connection using connection pool
+        $conn = Get-DatabaseConnection
 
         # Query for basic system details
         $systemQuery = @"
@@ -363,7 +809,7 @@ function Show-SystemDetails {
         $adapter.Fill($dataset) | Out-Null
         $disks = $dataset.Tables[0]
 
-        $conn.Close()
+        Return-DatabaseConnection $conn
 
         # Generate HTML for installed applications list
         $appsHtml = ""
@@ -650,7 +1096,8 @@ function Show-SystemDetails {
         return $html
     }
     catch {
-        return "<div class='alert alert-danger'>Error loading system details: $(Encode-HTML $_.Exception.Message)</div>"
+        if ($conn) { Return-DatabaseConnection $conn }
+        return Handle-Error -Operation "loading system details" -Error $_ -UserContext "AssetNumber: $AssetNumber"
     }
 }
 
@@ -752,8 +1199,7 @@ function Export-SystemData {
     )
     
     try {
-        $conn = New-Object System.Data.SqlClient.SqlConnection($connectionString)
-        $conn.Open()
+        $conn = Get-DatabaseConnection
 
         if (-not [string]::IsNullOrWhiteSpace($AssetNumber)) {
             # Export single system details
@@ -821,7 +1267,7 @@ function Export-SystemData {
             $data = $dataset.Tables[0]
         }
 
-        $conn.Close()
+        Return-DatabaseConnection $conn
 
         # Convert to requested format
         switch ($format.ToLower()) {
@@ -883,6 +1329,7 @@ function Export-SystemData {
         }
     }
     catch {
+        if ($conn) { Return-DatabaseConnection $conn }
         Write-Error "Export failed: $_"
         throw
     }
@@ -1002,6 +1449,54 @@ function Render-Dashboard {
     </div>
 "@
 
+    # Quick analytics summary
+    $quickAnalytics = @"
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header bg-info text-white">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <h6 class="mb-0">
+                            <i class="fas fa-chart-bar me-2"></i>Quick Analytics Summary
+                        </h6>
+                        <a href="/analytics" class="btn btn-sm btn-light">
+                            <i class="fas fa-chart-line me-1"></i>View Full Analytics
+                        </a>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="row text-center">
+                        <div class="col-md-3">
+                            <div class="border-end">
+                                <h4 class="text-primary mb-1">$($systemData.TotalCount)</h4>
+                                <small class="text-muted">Total Systems</small>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="border-end">
+                                <h4 class="text-success mb-1">$([math]::Round(($systemData.TotalCount / 30), 0))</h4>
+                                <small class="text-muted">Avg. Systems/Day</small>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="border-end">
+                                <h4 class="text-warning mb-1">$([math]::Round(($systemData.TotalCount / 7), 0))</h4>
+                                <small class="text-muted">This Week</small>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div>
+                                <h4 class="text-info mb-1">$([math]::Round(($systemData.TotalCount / 90), 0))</h4>
+                                <small class="text-muted">This Quarter</small>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+"@
+
     # Build system cards for the main listing
     $systemCards = ""
     foreach ($system in $systemData.Records) {
@@ -1039,7 +1534,7 @@ function Render-Dashboard {
     $paginationBottom = $paginationTop
 
     # Combine all components for list view
-    $output = $htmlHeader + $searchForm + $resultsCount + $paginationTop + @"
+    $output = $htmlHeader + $searchForm + $resultsCount + $quickAnalytics + @"
         <div class="row">
             $systemCards
         </div>
@@ -1063,13 +1558,716 @@ function Encode-HTML {
 }
 #endregion
 
+#region ANALYTICS FUNCTIONS
+
+<#
+.SYNOPSIS
+    Retrieves system trends and analytics data for charting
+#>
+function Get-SystemAnalytics {
+    param(
+        [string]$TimeRange = "30d",  # 7d, 30d, 90d, 1y
+        [string]$Metric = "all"      # all, memory, storage, performance, software
+    )
+    
+    try {
+        $conn = Get-DatabaseConnection
+        
+        # Calculate date range
+        $endDate = Get-Date
+        $startDate = switch ($TimeRange) {
+            "7d" { $endDate.AddDays(-7) }
+            "30d" { $endDate.AddDays(-30) }
+            "90d" { $endDate.AddDays(-90) }
+            "1y" { $endDate.AddYears(-1) }
+            default { $endDate.AddDays(-30) }
+        }
+        
+        $analytics = @{
+            TimeRange = $TimeRange
+            StartDate = $startDate.ToString("yyyy-MM-dd")
+            EndDate = $endDate.ToString("yyyy-MM-dd")
+            Charts = @{}
+            Insights = @{}
+        }
+        
+        # System growth trends
+        if ($Metric -eq "all" -or $Metric -eq "growth") {
+            $growthQuery = @"
+            SELECT 
+                CAST(ScanDate AS DATE) as Date,
+                COUNT(*) as NewSystems
+            FROM Systems 
+            WHERE ScanDate >= @StartDate AND ScanDate <= @EndDate
+            GROUP BY CAST(ScanDate AS DATE)
+            ORDER BY Date
+"@
+            $cmd = New-Object System.Data.SqlClient.SqlCommand($growthQuery, $conn)
+            $cmd.Parameters.AddWithValue("@StartDate", $startDate) | Out-Null
+            $cmd.Parameters.AddWithValue("@EndDate", $endDate) | Out-Null
+            
+            $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+            $dataset = New-Object System.Data.DataSet
+            $adapter.Fill($dataset) | Out-Null
+            $growthData = $dataset.Tables[0]
+            
+            $analytics.Charts.Growth = @{
+                Labels = @()
+                Data = @()
+                Cumulative = @()
+            }
+            
+            $cumulative = 0
+            foreach ($row in $growthData.Rows) {
+                $analytics.Charts.Growth.Labels += $row["Date"].ToString("MM/dd")
+                $analytics.Charts.Growth.Data += [int]$row["NewSystems"]
+                $cumulative += [int]$row["NewSystems"]
+                $analytics.Charts.Growth.Cumulative += $cumulative
+            }
+            
+            # Calculate growth insights
+            if ($analytics.Charts.Growth.Data.Count -gt 1) {
+                $avgGrowth = ($analytics.Charts.Growth.Data | Measure-Object -Average).Average
+                $trend = if ($analytics.Charts.Growth.Data[-1] -gt $analytics.Charts.Growth.Data[0]) { "increasing" } else { "decreasing" }
+                $analytics.Insights.Growth = @{
+                    AverageDaily = [math]::Round($avgGrowth, 1)
+                    Trend = $trend
+                    TotalGrowth = $analytics.Charts.Growth.Data.Count
+                    ProjectedMonthly = [math]::Round($avgGrowth * 30, 0)
+                }
+            }
+        }
+        
+        # Memory distribution trends
+        if ($Metric -eq "all" -or $Metric -eq "memory") {
+            $memoryQuery = @"
+            SELECT 
+                h.TotalRAMGB,
+                COUNT(*) as SystemCount
+            FROM Hardware h
+            JOIN Systems s ON h.AssetNumber = s.AssetNumber
+            WHERE s.ScanDate >= @StartDate AND s.ScanDate <= @EndDate
+            AND h.TotalRAMGB > 0
+            GROUP BY h.TotalRAMGB
+            ORDER BY h.TotalRAMGB
+"@
+            $cmd = New-Object System.Data.SqlClient.SqlCommand($memoryQuery, $conn)
+            $cmd.Parameters.AddWithValue("@StartDate", $startDate) | Out-Null
+            $cmd.Parameters.AddWithValue("@EndDate", $endDate) | Out-Null
+            
+            $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+            $dataset = New-Object System.Data.DataSet
+            $adapter.Fill($dataset) | Out-Null
+            $memoryData = $dataset.Tables[0]
+            
+            $analytics.Charts.Memory = @{
+                Labels = @()
+                Data = @()
+            }
+            
+            $totalSystems = 0
+            $totalMemory = 0
+            foreach ($row in $memoryData.Rows) {
+                $ramGB = [math]::Round($row["TotalRAMGB"], 0)
+                $systemCount = [int]$row["SystemCount"]
+                $analytics.Charts.Memory.Labels += "$ramGB GB"
+                $analytics.Charts.Memory.Data += $systemCount
+                $totalSystems += $systemCount
+                $totalMemory += ($ramGB * $systemCount)
+            }
+            
+            # Calculate memory insights
+            if ($totalSystems -gt 0) {
+                $avgMemory = $totalMemory / $totalSystems
+                $analytics.Insights.Memory = @{
+                    AverageRAM = [math]::Round($avgMemory, 1)
+                    TotalSystems = $totalSystems
+                    TotalRAM = [math]::Round($totalMemory, 0)
+                    MostCommon = $analytics.Charts.Memory.Labels[0]
+                }
+            }
+        }
+        
+        # Storage usage trends
+        if ($Metric -eq "all" -or $Metric -eq "storage") {
+            $storageQuery = @"
+            SELECT 
+                d.DeviceID,
+                d.SizeGB,
+                d.FreeGB,
+                (d.SizeGB - d.FreeGB) as UsedGB,
+                ROUND(((d.SizeGB - d.FreeGB) / d.SizeGB) * 100, 2) as UsagePercent
+            FROM Disks d
+            JOIN Hardware h ON d.HardwareID = h.HardwareID
+            JOIN Systems s ON h.AssetNumber = s.AssetNumber
+            WHERE s.ScanDate >= @StartDate AND s.ScanDate <= @EndDate
+            AND d.SizeGB > 0
+            ORDER BY UsagePercent DESC
+"@
+            $cmd = New-Object System.Data.SqlClient.SqlCommand($storageQuery, $conn)
+            $cmd.Parameters.AddWithValue("@StartDate", $startDate) | Out-Null
+            $cmd.Parameters.AddWithValue("@EndDate", $endDate) | Out-Null
+            
+            $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+            $dataset = New-Object System.Data.DataSet
+            $adapter.Fill($dataset) | Out-Null
+            $storageData = $dataset.Tables[0]
+            
+            $analytics.Charts.Storage = @{
+                Labels = @()
+                UsedData = @()
+                FreeData = @()
+                UsagePercent = @()
+            }
+            
+            $totalSize = 0
+            $totalUsed = 0
+            $totalFree = 0
+            foreach ($row in $storageData.Rows) {
+                $analytics.Charts.Storage.Labels += $row["DeviceID"]
+                $analytics.Charts.Storage.UsedData += [math]::Round($row["UsedGB"], 2)
+                $analytics.Charts.Storage.FreeData += [math]::Round($row["FreeGB"], 2)
+                $analytics.Charts.Storage.UsagePercent += [math]::Round($row["UsagePercent"], 1)
+                
+                $totalSize += $row["SizeGB"]
+                $totalUsed += $row["UsedGB"]
+                $totalFree += $row["FreeGB"]
+            }
+            
+            # Calculate storage insights
+            if ($totalSize -gt 0) {
+                $overallUsage = ($totalUsed / $totalSize) * 100
+                $analytics.Insights.Storage = @{
+                    TotalSize = [math]::Round($totalSize, 0)
+                    TotalUsed = [math]::Round($totalUsed, 0)
+                    TotalFree = [math]::Round($totalFree, 0)
+                    OverallUsage = [math]::Round($overallUsage, 1)
+                    Status = if ($overallUsage -gt 90) { "Critical" } elseif ($overallUsage -gt 70) { "Warning" } else { "Healthy" }
+                }
+            }
+        }
+        
+        # Operating system distribution
+        if ($Metric -eq "all" -or $Metric -eq "os") {
+            $osQuery = @"
+            SELECT 
+                s.OS,
+                COUNT(*) as SystemCount
+            FROM Systems s
+            WHERE s.ScanDate >= @StartDate AND s.ScanDate <= @EndDate
+            GROUP BY s.OS
+            ORDER BY SystemCount DESC
+"@
+            $cmd = New-Object System.Data.SqlClient.SqlCommand($osQuery, $conn)
+            $cmd.Parameters.AddWithValue("@StartDate", $startDate) | Out-Null
+            $cmd.Parameters.AddWithValue("@EndDate", $endDate) | Out-Null
+            
+            $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+            $dataset = New-Object System.Data.DataSet
+            $adapter.Fill($dataset) | Out-Null
+            $osData = $dataset.Tables[0]
+            
+            $analytics.Charts.OperatingSystems = @{
+                Labels = @()
+                Data = @()
+            }
+            
+            $totalOS = 0
+            foreach ($row in $osData.Rows) {
+                $analytics.Charts.OperatingSystems.Labels += $row["OS"]
+                $analytics.Charts.OperatingSystems.Data += [int]$row["SystemCount"]
+                $totalOS += [int]$row["SystemCount"]
+            }
+            
+            # Calculate OS insights
+            if ($totalOS -gt 0) {
+                $dominantOS = $analytics.Charts.OperatingSystems.Labels[0]
+                $dominantCount = $analytics.Charts.OperatingSystems.Data[0]
+                $dominantPercentage = [math]::Round(($dominantCount / $totalOS) * 100, 1)
+                
+                $analytics.Insights.OperatingSystems = @{
+                    TotalSystems = $totalOS
+                    DominantOS = $dominantOS
+                    DominantPercentage = $dominantPercentage
+                    Diversity = $analytics.Charts.OperatingSystems.Labels.Count
+                }
+            }
+        }
+        
+        # Software installation trends
+        if ($Metric -eq "all" -or $Metric -eq "software") {
+            $softwareQuery = @"
+            SELECT 
+                CAST(s.InstallDate AS DATE) as Date,
+                COUNT(*) as Installations
+            FROM Software s
+            WHERE s.IsApplication = 1 
+            AND s.InstallDate >= @StartDate 
+            AND s.InstallDate <= @EndDate
+            GROUP BY CAST(s.InstallDate AS DATE)
+            ORDER BY Date
+"@
+            $cmd = New-Object System.Data.SqlClient.SqlCommand($softwareQuery, $conn)
+            $cmd.Parameters.AddWithValue("@StartDate", $startDate) | Out-Null
+            $cmd.Parameters.AddWithValue("@EndDate", $endDate) | Out-Null
+            
+            $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+            $dataset = New-Object System.Data.DataSet
+            $adapter.Fill($dataset) | Out-Null
+            $softwareData = $dataset.Tables[0]
+            
+            $analytics.Charts.Software = @{
+                Labels = @()
+                Data = @()
+            }
+            
+            $totalInstallations = 0
+            foreach ($row in $softwareData.Rows) {
+                $analytics.Charts.Software.Labels += $row["Date"].ToString("MM/dd")
+                $analytics.Charts.Software.Data += [int]$row["Installations"]
+                $totalInstallations += [int]$row["Installations"]
+            }
+            
+            # Calculate software insights
+            if ($analytics.Charts.Software.Data.Count -gt 0) {
+                $avgInstallations = $totalInstallations / $analytics.Charts.Software.Data.Count
+                $analytics.Insights.Software = @{
+                    TotalInstallations = $totalInstallations
+                    AverageDaily = [math]::Round($avgInstallations, 1)
+                    ActiveDays = $analytics.Charts.Software.Data.Count
+                }
+            }
+        }
+        
+        # Performance metrics
+        if ($Metric -eq "all" -or $Metric -eq "performance") {
+            $performanceQuery = @"
+            SELECT 
+                h.CPUCores,
+                h.TotalRAMGB,
+                COUNT(*) as SystemCount
+            FROM Hardware h
+            JOIN Systems s ON h.AssetNumber = s.AssetNumber
+            WHERE s.ScanDate >= @StartDate AND s.ScanDate <= @EndDate
+            GROUP BY h.CPUCores, h.TotalRAMGB
+            ORDER BY h.CPUCores, h.TotalRAMGB
+"@
+            $cmd = New-Object System.Data.SqlClient.SqlCommand($performanceQuery, $conn)
+            $cmd.Parameters.AddWithValue("@StartDate", $startDate) | Out-Null
+            $cmd.Parameters.AddWithValue("@EndDate", $endDate) | Out-Null
+            
+            $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+            $dataset = New-Object System.Data.DataSet
+            $adapter.Fill($dataset) | Out-Null
+            $performanceData = $dataset.Tables[0]
+            
+            $analytics.Charts.Performance = @{
+                Labels = @()
+                Data = @()
+            }
+            
+            $totalPerformance = 0
+            $avgCores = 0
+            $avgRAM = 0
+            foreach ($row in $performanceData.Rows) {
+                $label = "$($row["CPUCores"]) Cores, $([math]::Round($row["TotalRAMGB"], 0)) GB RAM"
+                $analytics.Charts.Performance.Labels += $label
+                $analytics.Charts.Performance.Data += [int]$row["SystemCount"]
+                $totalPerformance += [int]$row["SystemCount"]
+                $avgCores += ($row["CPUCores"] * [int]$row["SystemCount"])
+                $avgRAM += ($row["TotalRAMGB"] * [int]$row["SystemCount"])
+            }
+            
+            # Calculate performance insights
+            if ($totalPerformance -gt 0) {
+                $analytics.Insights.Performance = @{
+                    TotalSystems = $totalPerformance
+                    AverageCores = [math]::Round($avgCores / $totalPerformance, 1)
+                    AverageRAM = [math]::Round($avgRAM / $totalPerformance, 1)
+                    PerformanceLevels = $analytics.Charts.Performance.Labels.Count
+                }
+            }
+        }
+        
+        Return-DatabaseConnection $conn
+        return $analytics
+    }
+    catch {
+        if ($conn) { Return-DatabaseConnection $conn }
+        Write-Error "Failed to retrieve analytics data: $_"
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
+    Generates HTML for analytics dashboard with charts
+#>
+function Render-AnalyticsDashboard {
+    param(
+        [string]$TimeRange = "30d",
+        [string]$Metric = "all"
+    )
+    
+    $analytics = Get-SystemAnalytics -TimeRange $TimeRange -Metric $Metric
+    
+    if (-not $analytics) {
+        return "<div class='alert alert-danger'>Failed to load analytics data</div>"
+    }
+    
+    $html = @"
+    <div class="card mb-4">
+        <div class="card-header bg-primary text-white">
+            <div class="d-flex justify-content-between align-items-center">
+                <h5 class="mb-0">
+                    <i class="fas fa-chart-line me-2"></i>System Analytics Dashboard
+                </h5>
+                <div class="btn-group">
+                    <button class="btn btn-sm btn-light" onclick="changeTimeRange('7d')">7 Days</button>
+                    <button class="btn btn-sm btn-light" onclick="changeTimeRange('30d')">30 Days</button>
+                    <button class="btn btn-sm btn-light" onclick="changeTimeRange('90d')">90 Days</button>
+                    <button class="btn btn-sm btn-light" onclick="changeTimeRange('1y')">1 Year</button>
+                </div>
+            </div>
+        </div>
+        <div class="card-body">
+            <!-- Analytics Insights Summary -->
+            <div class="row mb-4">
+                <div class="col-12">
+                    <h6><i class="fas fa-lightbulb me-2"></i>Key Insights</h6>
+                    <div class="row">
+                        $(if ($analytics.Insights.Growth) { @"
+                        <div class="col-md-3 mb-3">
+                            <div class="card border-primary">
+                                <div class="card-body text-center">
+                                    <h6 class="card-title text-primary">Growth Trend</h6>
+                                    <h4 class="text-success">$($analytics.Insights.Growth.AverageDaily)</h4>
+                                    <small class="text-muted">Avg. systems/day</small>
+                                    <div class="mt-2">
+                                        <span class="badge bg-$(if ($analytics.Insights.Growth.Trend -eq 'increasing') { 'success' } else { 'warning' })">
+                                            $($analytics.Insights.Growth.Trend.ToUpper())
+                                        </span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+"@ })
+                        $(if ($analytics.Insights.Memory) { @"
+                        <div class="col-md-3 mb-3">
+                            <div class="card border-info">
+                                <div class="card-body text-center">
+                                    <h6 class="card-title text-info">Memory Profile</h6>
+                                    <h4 class="text-info">$($analytics.Insights.Memory.AverageRAM) GB</h4>
+                                    <small class="text-muted">Average RAM</small>
+                                    <div class="mt-2">
+                                        <span class="badge bg-secondary">$($analytics.Insights.Memory.TotalSystems) systems</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+"@ })
+                        $(if ($analytics.Insights.Storage) { @"
+                        <div class="col-md-3 mb-3">
+                            <div class="card border-$(if ($analytics.Insights.Storage.Status -eq 'Critical') { 'danger' } elseif ($analytics.Insights.Storage.Status -eq 'Warning') { 'warning' } else { 'success' })">
+                                <div class="card-body text-center">
+                                    <h6 class="card-title text-$(if ($analytics.Insights.Storage.Status -eq 'Critical') { 'danger' } elseif ($analytics.Insights.Storage.Status -eq 'Warning') { 'warning' } else { 'success' })">Storage Status</h6>
+                                    <h4 class="text-$(if ($analytics.Insights.Storage.Status -eq 'Critical') { 'danger' } elseif ($analytics.Insights.Storage.Status -eq 'Warning') { 'warning' } else { 'success' })">$($analytics.Insights.Storage.OverallUsage)%</h4>
+                                    <small class="text-muted">Overall usage</small>
+                                    <div class="mt-2">
+                                        <span class="badge bg-$(if ($analytics.Insights.Storage.Status -eq 'Critical') { 'danger' } elseif ($analytics.Insights.Storage.Status -eq 'Warning') { 'warning' } else { 'success' })">$($analytics.Insights.Storage.Status)</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+"@ })
+                        $(if ($analytics.Insights.OperatingSystems) { @"
+                        <div class="col-md-3 mb-3">
+                            <div class="card border-warning">
+                                <div class="card-body text-center">
+                                    <h6 class="card-title text-warning">OS Diversity</h6>
+                                    <h4 class="text-warning">$($analytics.Insights.OperatingSystems.DominantPercentage)%</h4>
+                                    <small class="text-muted">$($analytics.Insights.OperatingSystems.DominantOS)</small>
+                                    <div class="mt-2">
+                                        <span class="badge bg-secondary">$($analytics.Insights.OperatingSystems.Diversity) variants</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+"@ })
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Export Options -->
+            <div class="row mb-4">
+                <div class="col-12">
+                    <div class="card">
+                        <div class="card-header">
+                            <h6><i class="fas fa-download me-2"></i>Export Analytics Data</h6>
+                        </div>
+                        <div class="card-body">
+                            <div class="btn-group">
+                                <button class="btn btn-outline-primary" onclick="exportAnalytics('csv')">
+                                    <i class="fas fa-file-csv me-1"></i>Export CSV
+                                </button>
+                                <button class="btn btn-outline-primary" onclick="exportAnalytics('json')">
+                                    <i class="fas fa-file-code me-1"></i>Export JSON
+                                </button>
+                                <button class="btn btn-outline-primary" onclick="exportAnalytics('pdf')">
+                                    <i class="fas fa-file-pdf me-1"></i>Export PDF
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- System Growth Chart -->
+            <div class="row mb-4">
+                <div class="col-12">
+                    <div class="card">
+                        <div class="card-header">
+                            <h6><i class="fas fa-chart-line me-2"></i>System Growth Trends</h6>
+                        </div>
+                        <div class="card-body">
+                            <canvas id="growthChart" width="400" height="200"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Memory Distribution Chart -->
+            <div class="row mb-4">
+                <div class="col-md-6">
+                    <div class="card">
+                        <div class="card-header">
+                            <h6><i class="fas fa-memory me-2"></i>Memory Distribution</h6>
+                        </div>
+                        <div class="card-body">
+                            <canvas id="memoryChart" width="400" height="200"></canvas>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card">
+                        <div class="card-header">
+                            <h6><i class="fas fa-hdd me-2"></i>Storage Usage</h6>
+                        </div>
+                        <div class="card-body">
+                            <canvas id="storageChart" width="400" height="200"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- OS Distribution and Performance Charts -->
+            <div class="row mb-4">
+                <div class="col-md-6">
+                    <div class="card">
+                        <div class="card-header">
+                            <h6><i class="fas fa-windows me-2"></i>Operating System Distribution</h6>
+                        </div>
+                        <div class="card-body">
+                            <canvas id="osChart" width="400" height="200"></canvas>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="card">
+                        <div class="card-header">
+                            <h6><i class="fas fa-microchip me-2"></i>Performance Distribution</h6>
+                        </div>
+                        <div class="card-body">
+                            <canvas id="performanceChart" width="400" height="200"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Chart.js configuration and data
+        const analyticsData = $(ConvertTo-Json -Depth 10 $analytics);
+        
+        // System Growth Chart
+        const growthCtx = document.getElementById('growthChart').getContext('2d');
+        new Chart(growthCtx, {
+            type: 'line',
+            data: {
+                labels: analyticsData.Charts.Growth.Labels,
+                datasets: [{
+                    label: 'New Systems',
+                    data: analyticsData.Charts.Growth.Data,
+                    borderColor: 'rgb(75, 192, 192)',
+                    backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                    tension: 0.1
+                }, {
+                    label: 'Cumulative Systems',
+                    data: analyticsData.Charts.Growth.Cumulative,
+                    borderColor: 'rgb(255, 99, 132)',
+                    backgroundColor: 'rgba(255, 99, 132, 0.2)',
+                    tension: 0.1
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'System Growth Over Time'
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true
+                    }
+                }
+            }
+        });
+        
+        // Memory Distribution Chart
+        const memoryCtx = document.getElementById('memoryChart').getContext('2d');
+        new Chart(memoryCtx, {
+            type: 'doughnut',
+            data: {
+                labels: analyticsData.Charts.Memory.Labels,
+                datasets: [{
+                    data: analyticsData.Charts.Memory.Data,
+                    backgroundColor: [
+                        '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0',
+                        '#9966FF', '#FF9F40', '#FF6384', '#C9CBCF'
+                    ]
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'Memory Distribution'
+                    }
+                }
+            }
+        });
+        
+        // Storage Usage Chart
+        const storageCtx = document.getElementById('storageChart').getContext('2d');
+        new Chart(storageCtx, {
+            type: 'bar',
+            data: {
+                labels: analyticsData.Charts.Storage.Labels,
+                datasets: [{
+                    label: 'Used (GB)',
+                    data: analyticsData.Charts.Storage.UsedData,
+                    backgroundColor: 'rgba(255, 99, 132, 0.8)'
+                }, {
+                    label: 'Free (GB)',
+                    data: analyticsData.Charts.Storage.FreeData,
+                    backgroundColor: 'rgba(75, 192, 192, 0.8)'
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'Storage Usage by Device'
+                    }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true
+                    }
+                }
+            }
+        });
+        
+        // OS Distribution Chart
+        const osCtx = document.getElementById('osChart').getContext('2d');
+        new Chart(osCtx, {
+            type: 'pie',
+            data: {
+                labels: analyticsData.Charts.OperatingSystems.Labels,
+                datasets: [{
+                    data: analyticsData.Charts.OperatingSystems.Data,
+                    backgroundColor: [
+                        '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0',
+                        '#9966FF', '#FF9F40', '#FF6384', '#C9CBCF'
+                    ]
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'Operating System Distribution'
+                    }
+                }
+            }
+        });
+        
+        // Performance Distribution Chart
+        const performanceCtx = document.getElementById('performanceChart').getContext('2d');
+        new Chart(performanceCtx, {
+            type: 'horizontalBar',
+            data: {
+                labels: analyticsData.Charts.Performance.Labels,
+                datasets: [{
+                    label: 'System Count',
+                    data: analyticsData.Charts.Performance.Data,
+                    backgroundColor: 'rgba(54, 162, 235, 0.8)'
+                }]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'Performance Distribution'
+                    }
+                },
+                scales: {
+                    x: {
+                        beginAtZero: true
+                    }
+                }
+            }
+        });
+        
+        // Time range change function
+        function changeTimeRange(range) {
+            window.location.href = '/analytics?range=' + range;
+        }
+        
+        // Export analytics function
+        function exportAnalytics(format) {
+            const timeRange = new URLSearchParams(window.location.search).get('range') || '30d';
+            window.location.href = '/export-analytics?range=' + timeRange + '&format=' + format;
+        }
+    </script>
+"@
+    
+    return $html
+}
+
+#endregion
+
 #region WEB SERVER
+
+# Start health monitoring
+Write-Host "Starting health monitoring..." -ForegroundColor Yellow
+$healthMonitoringJob = Start-HealthMonitoring
+
 try {
     # Initialize HTTP listener
     $listener = New-Object System.Net.HttpListener
     $listener.Prefixes.Add("http://localhost:$port/")
     $listener.Start()
     Write-Host "Dashboard running at http://localhost:$port" -ForegroundColor Green
+    Write-Host "Health monitoring started" -ForegroundColor Green
+    Write-Host "Press Ctrl+C to stop the dashboard" -ForegroundColor Yellow
 
     # Main request handling loop
     while ($listener.IsListening) {
@@ -1077,6 +2275,7 @@ try {
             $context = $listener.GetContext()
             $request = $context.Request
             $response = $context.Response
+            $startTime = Get-Date
 
             try {
                 # Parse query parameters from URL
@@ -1093,10 +2292,10 @@ try {
                     $startTime = Get-Date
                     
                     # Get parameters with defaults
-                    $searchTerm = $queryParams["search"] ?? ""
-                    $page = [int]($queryParams["page"] ?? 1)
-                    $AssetNumber = $queryParams["AssetNumber"] ?? ""
-                    $format = $queryParams["format"] ?? "csv"
+                    $searchTerm = if ($queryParams.ContainsKey("search")) { $queryParams["search"] } else { "" }
+                    $page = if ($queryParams.ContainsKey("page")) { [int]$queryParams["page"] } else { 1 }
+                    $AssetNumber = if ($queryParams.ContainsKey("AssetNumber")) { $queryParams["AssetNumber"] } else { "" }
+                    $format = if ($queryParams.ContainsKey("format")) { $queryParams["format"] } else { "csv" }
                     
                     $exportData = Export-SystemData -searchTerm $searchTerm -page $page -AssetNumber $AssetNumber -format $format
                     
@@ -1123,10 +2322,86 @@ try {
                     continue
                 }
 
+                # Handle health check request
+                if ($request.Url.LocalPath -eq "/health") {
+                    $healthData = Get-SystemHealth
+                    $jsonResponse = $healthData | ConvertTo-Json -Depth 5
+                    $response.ContentType = "application/json"
+                    $response.ContentLength64 = $jsonResponse.Length
+                    $response.OutputStream.Write($jsonResponse, 0, $jsonResponse.Length)
+                    $response.OutputStream.Close()
+                    continue
+                }
+
+                # Handle analytics request
+                if ($request.Url.LocalPath -eq "/analytics") {
+                    $timeRange = if ($queryParams.ContainsKey("range")) { $queryParams["range"] } else { "30d" }
+                    $metric = if ($queryParams.ContainsKey("metric")) { $queryParams["metric"] } else { "all" }
+                    $analyticsHtml = Render-AnalyticsDashboard -TimeRange $timeRange -Metric $metric
+                    $buffer = [System.Text.Encoding]::UTF8.GetBytes($analyticsHtml)
+                    $response.ContentLength64 = $buffer.Length
+                    $response.ContentType = "text/html; charset=utf-8"
+                    $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                    $response.OutputStream.Close()
+                    continue
+                }
+
+                # Handle analytics export request
+                if ($request.Url.LocalPath -eq "/export-analytics") {
+                    $startTime = Get-Date
+                    $timeRange = if ($queryParams.ContainsKey("range")) { $queryParams["range"] } else { "30d" }
+                    $format = if ($queryParams.ContainsKey("format")) { $queryParams["format"] } else { "csv" }
+                    
+                    $analyticsData = Get-SystemAnalytics -TimeRange $timeRange -Metric "all"
+                    
+                    if ($format -eq "csv") {
+                        $csvContent = Export-AnalyticsToCSV -AnalyticsData $analyticsData
+                        $buffer = [System.Text.Encoding]::UTF8.GetBytes($csvContent)
+                        $response.ContentType = "text/csv"
+                        $filename = "Analytics_$timeRange.csv"
+                        $response.AddHeader("Content-Disposition", "attachment; filename=$filename")
+                    }
+                    elseif ($format -eq "json") {
+                        $jsonContent = $analyticsData | ConvertTo-Json -Depth 10
+                        $buffer = [System.Text.Encoding]::UTF8.GetBytes($jsonContent)
+                        $response.ContentType = "application/json"
+                        $filename = "Analytics_$timeRange.json"
+                        $response.AddHeader("Content-Disposition", "attachment; filename=$filename")
+                    }
+                    elseif ($format -eq "pdf") {
+                        $pdfContent = Export-AnalyticsToPDF -AnalyticsData $analyticsData
+                        $buffer = [System.Text.Encoding]::UTF8.GetBytes($pdfContent)
+                        $response.ContentType = "application/pdf"
+                        $filename = "Analytics_$timeRange.pdf"
+                        $response.AddHeader("Content-Disposition", "attachment; filename=$filename")
+                    }
+                    
+                    $response.ContentLength64 = $buffer.Length
+                    $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                    $response.OutputStream.Close()
+                    
+                    $duration = ((Get-Date) - $startTime).TotalMilliseconds
+                    Log-Performance -operation "ExportAnalytics" -durationMs $duration -details "Format=$format, TimeRange=$timeRange"
+                    
+                    continue
+                }
+
+                # Get client IP for rate limiting
+                $clientIP = $request.RemoteEndPoint.Address.ToString()
+                
+                # Test rate limit
+                if (-not (Test-RateLimit -ClientIP $clientIP)) {
+                    $response.StatusCode = 429 # Too Many Requests
+                    $response.ContentType = "text/html"
+                    $response.ContentLength64 = 0
+                    $response.OutputStream.Close()
+                    continue
+                }
+
                 # Get parameters with defaults for regular requests
-                $searchTerm = $queryParams["search"] ?? ""
-                $page = [int]($queryParams["page"] ?? 1)
-                $AssetNumber = $queryParams["AssetNumber"] ?? ""
+                $searchTerm = if ($queryParams.ContainsKey("search")) { $queryParams["search"] } else { "" }
+                $page = if ($queryParams.ContainsKey("page")) { [int]$queryParams["page"] } else { 1 }
+                $AssetNumber = if ($queryParams.ContainsKey("AssetNumber")) { $queryParams["AssetNumber"] } else { "" }
 
                 # Generate and send HTML response
                 $html = Render-Dashboard -searchTerm $searchTerm -page $page -AssetNumber $AssetNumber
@@ -1136,6 +2411,9 @@ try {
                 $response.ContentType = "text/html; charset=utf-8"
                 $response.OutputStream.Write($buffer, 0, $buffer.Length)
                 $response.OutputStream.Close()
+
+                # Update request statistics
+                Update-RequestStats -Success $true -ResponseTime ((Get-Date) - $startTime).TotalMilliseconds
             }
             catch {
                 # Error page for request processing failures
@@ -1165,7 +2443,8 @@ try {
                 $response.OutputStream.Write($buffer, 0, $buffer.Length)
                 $response.OutputStream.Close()
                 
-                Write-Host "Error processing request: $_" -ForegroundColor Red
+                # Update request statistics
+                Update-RequestStats -Success $false -ResponseTime ((Get-Date) - $startTime).TotalMilliseconds
             }
         }
         catch {
@@ -1182,7 +2461,293 @@ finally {
         $listener.Stop()
     }
     
+    # Stop health monitoring job
+    if ($healthMonitoringJob) {
+        Stop-Job $healthMonitoringJob
+        Remove-Job $healthMonitoringJob
+    }
+    
     # Log shutdown
     Write-Host "Dashboard server stopped" -ForegroundColor Yellow
 }
+#endregion
+
+#region EXPORT FUNCTIONS
+
+<#
+.SYNOPSIS
+    Exports analytics data to CSV format
+#>
+function Export-AnalyticsToCSV {
+    param([object]$AnalyticsData)
+    
+    $csvLines = @()
+    $csvLines += "System Analytics Report - $($AnalyticsData.TimeRange.ToUpper())"
+    $csvLines += "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    $csvLines += "Time Range: $($AnalyticsData.StartDate) to $($AnalyticsData.EndDate)"
+    $csvLines += ""
+    
+    # Growth data
+    if ($AnalyticsData.Charts.Growth) {
+        $csvLines += "System Growth Trends"
+        $csvLines += "Date,New Systems,Cumulative Systems"
+        for ($i = 0; $i -lt $AnalyticsData.Charts.Growth.Labels.Count; $i++) {
+            $csvLines += "$($AnalyticsData.Charts.Growth.Labels[$i]),$($AnalyticsData.Charts.Growth.Data[$i]),$($AnalyticsData.Charts.Growth.Cumulative[$i])"
+        }
+        $csvLines += ""
+    }
+    
+    # Memory data
+    if ($AnalyticsData.Charts.Memory) {
+        $csvLines += "Memory Distribution"
+        $csvLines += "RAM (GB),System Count"
+        for ($i = 0; $i -lt $AnalyticsData.Charts.Memory.Labels.Count; $i++) {
+            $csvLines += "$($AnalyticsData.Charts.Memory.Labels[$i]),$($AnalyticsData.Charts.Memory.Data[$i])"
+        }
+        $csvLines += ""
+    }
+    
+    # Storage data
+    if ($AnalyticsData.Charts.Storage) {
+        $csvLines += "Storage Usage"
+        $csvLines += "Device,Used (GB),Free (GB),Usage (%)"
+        for ($i = 0; $i -lt $AnalyticsData.Charts.Storage.Labels.Count; $i++) {
+            $csvLines += "$($AnalyticsData.Charts.Storage.Labels[$i]),$($AnalyticsData.Charts.Storage.UsedData[$i]),$($AnalyticsData.Charts.Storage.FreeData[$i]),$($AnalyticsData.Charts.Storage.UsagePercent[$i])"
+        }
+        $csvLines += ""
+    }
+    
+    # OS data
+    if ($AnalyticsData.Charts.OperatingSystems) {
+        $csvLines += "Operating System Distribution"
+        $csvLines += "OS,System Count"
+        for ($i = 0; $i -lt $AnalyticsData.Charts.OperatingSystems.Labels.Count; $i++) {
+            $csvLines += "$($AnalyticsData.Charts.OperatingSystems.Labels[$i]),$($AnalyticsData.Charts.OperatingSystems.Data[$i])"
+        }
+        $csvLines += ""
+    }
+    
+    # Performance data
+    if ($AnalyticsData.Charts.Performance) {
+        $csvLines += "Performance Distribution"
+        $csvLines += "Specification,System Count"
+        for ($i = 0; $i -lt $AnalyticsData.Charts.Performance.Labels.Count; $i++) {
+            $csvLines += "$($AnalyticsData.Charts.Performance.Labels[$i]),$($AnalyticsData.Charts.Performance.Data[$i])"
+        }
+        $csvLines += ""
+    }
+    
+    # Insights summary
+    if ($AnalyticsData.Insights) {
+        $csvLines += "Key Insights Summary"
+        $csvLines += "Metric,Value,Details"
+        
+        if ($AnalyticsData.Insights.Growth) {
+            $csvLines += "Growth Trend,$($AnalyticsData.Insights.Growth.Trend),Average: $($AnalyticsData.Insights.Growth.AverageDaily) systems/day"
+            $csvLines += "Projected Monthly,,$($AnalyticsData.Insights.Growth.ProjectedMonthly) systems"
+        }
+        
+        if ($AnalyticsData.Insights.Memory) {
+            $csvLines += "Memory Profile,$($AnalyticsData.Insights.Memory.AverageRAM) GB,$($AnalyticsData.Insights.Memory.TotalSystems) systems"
+        }
+        
+        if ($AnalyticsData.Insights.Storage) {
+            $csvLines += "Storage Status,$($AnalyticsData.Insights.Storage.OverallUsage)%,$($AnalyticsData.Insights.Storage.Status)"
+        }
+        
+        if ($AnalyticsData.Insights.OperatingSystems) {
+            $csvLines += "OS Diversity,$($AnalyticsData.Insights.OperatingSystems.DominantPercentage)%,$($AnalyticsData.Insights.OperatingSystems.DominantOS)"
+        }
+    }
+    
+    return ($csvLines -join "`r`n")
+}
+
+<#
+.SYNOPSIS
+    Exports analytics data to PDF format (HTML-based for simplicity)
+#>
+function Export-AnalyticsToPDF {
+    param([object]$AnalyticsData)
+    
+    $htmlContent = @"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>System Analytics Report - $($AnalyticsData.TimeRange.ToUpper())</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .header { text-align: center; border-bottom: 2px solid #333; padding-bottom: 20px; margin-bottom: 30px; }
+        .section { margin-bottom: 30px; }
+        .section h2 { color: #2c3e50; border-bottom: 1px solid #bdc3c7; padding-bottom: 10px; }
+        .insight-card { border: 1px solid #ddd; padding: 15px; margin: 10px 0; border-radius: 5px; }
+        .insight-title { font-weight: bold; color: #2c3e50; }
+        .insight-value { font-size: 18px; color: #27ae60; margin: 5px 0; }
+        .insight-details { color: #7f8c8d; font-size: 14px; }
+        table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f8f9fa; font-weight: bold; }
+        .status-healthy { color: #27ae60; }
+        .status-warning { color: #f39c12; }
+        .status-critical { color: #e74c3c; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>System Analytics Report</h1>
+        <h3>$($AnalyticsData.TimeRange.ToUpper()) Analysis</h3>
+        <p>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+        <p>Time Range: $($AnalyticsData.StartDate) to $($AnalyticsData.EndDate)</p>
+    </div>
+    
+    <div class="section">
+        <h2>Key Insights</h2>
+        $(if ($AnalyticsData.Insights.Growth) { @"
+        <div class="insight-card">
+            <div class="insight-title">Growth Trend</div>
+            <div class="insight-value">$($AnalyticsData.Insights.Growth.AverageDaily) systems/day average</div>
+            <div class="insight-details">Trend: $($AnalyticsData.Insights.Growth.Trend.ToUpper()) | Projected Monthly: $($AnalyticsData.Insights.Growth.ProjectedMonthly) systems</div>
+        </div>
+"@ })
+        $(if ($AnalyticsData.Insights.Memory) { @"
+        <div class="insight-card">
+            <div class="insight-title">Memory Profile</div>
+            <div class="insight-value">$($AnalyticsData.Insights.Memory.AverageRAM) GB average RAM</div>
+            <div class="insight-details">Total Systems: $($AnalyticsData.Insights.Memory.TotalSystems) | Total RAM: $($AnalyticsData.Insights.Memory.TotalRAM) GB</div>
+        </div>
+"@ })
+        $(if ($AnalyticsData.Insights.Storage) { @"
+        <div class="insight-card">
+            <div class="insight-title">Storage Status</div>
+            <div class="insight-value status-$($AnalyticsData.Insights.Storage.Status.ToLower())">$($AnalyticsData.Insights.Storage.OverallUsage)% overall usage</div>
+            <div class="insight-details">Status: $($AnalyticsData.Insights.Storage.Status) | Total Size: $($AnalyticsData.Insights.Storage.TotalSize) GB | Used: $($AnalyticsData.Insights.Storage.TotalUsed) GB</div>
+        </div>
+"@ })
+        $(if ($AnalyticsData.Insights.OperatingSystems) { @"
+        <div class="insight-card">
+            <div class="insight-title">Operating System Diversity</div>
+            <div class="insight-value">$($AnalyticsData.Insights.OperatingSystems.DominantOS) dominates with $($AnalyticsData.Insights.OperatingSystems.DominantPercentage)%</div>
+            <div class="insight-details">Total Systems: $($AnalyticsData.Insights.OperatingSystems.TotalSystems) | Variants: $($AnalyticsData.Insights.OperatingSystems.Diversity)</div>
+        </div>
+"@ })
+    </div>
+    
+    $(if ($AnalyticsData.Charts.Growth) { @"
+    <div class="section">
+        <h2>System Growth Trends</h2>
+        <table>
+            <thead>
+                <tr><th>Date</th><th>New Systems</th><th>Cumulative Systems</th></tr>
+            </thead>
+            <tbody>
+                $(for ($i = 0; $i -lt $AnalyticsData.Charts.Growth.Labels.Count; $i++) { @"
+                <tr>
+                    <td>$($AnalyticsData.Charts.Growth.Labels[$i])</td>
+                    <td>$($AnalyticsData.Charts.Growth.Data[$i])</td>
+                    <td>$($AnalyticsData.Charts.Growth.Cumulative[$i])</td>
+                </tr>
+"@ })
+            </tbody>
+        </table>
+    </div>
+"@ })
+    
+    $(if ($AnalyticsData.Charts.Memory) { @"
+    <div class="section">
+        <h2>Memory Distribution</h2>
+        <table>
+            <thead>
+                <tr><th>RAM (GB)</th><th>System Count</th></tr>
+            </thead>
+            <tbody>
+                $(for ($i = 0; $i -lt $AnalyticsData.Charts.Memory.Labels.Count; $i++) { @"
+                <tr>
+                    <td>$($AnalyticsData.Charts.Memory.Labels[$i])</td>
+                    <td>$($AnalyticsData.Charts.Memory.Data[$i])</td>
+                </tr>
+"@ })
+            </tbody>
+        </table>
+    </div>
+"@ })
+    
+    $(if ($AnalyticsData.Charts.Storage) { @"
+    <div class="section">
+        <h2>Storage Usage</h2>
+        <table>
+            <thead>
+                <tr><th>Device</th><th>Used (GB)</th><th>Free (GB)</th><th>Usage (%)</th></tr>
+            </thead>
+            <tbody>
+                $(for ($i = 0; $i -lt $AnalyticsData.Charts.Storage.Labels.Count; $i++) { @"
+                <tr>
+                    <td>$($AnalyticsData.Charts.Storage.Labels[$i])</td>
+                    <td>$($AnalyticsData.Charts.Storage.UsedData[$i])</td>
+                    <td>$($AnalyticsData.Charts.Storage.FreeData[$i])</td>
+                    <td>$($AnalyticsData.Charts.Storage.UsagePercent[$i])%</td>
+                </tr>
+"@ })
+            </tbody>
+        </table>
+    </div>
+"@ })
+    
+    $(if ($AnalyticsData.Charts.OperatingSystems) { @"
+    <div class="section">
+        <h2>Operating System Distribution</h2>
+        <table>
+            <thead>
+                <tr><th>Operating System</th><th>System Count</th></tr>
+            </thead>
+            <tbody>
+                $(for ($i = 0; $i -lt $AnalyticsData.Charts.OperatingSystems.Labels.Count; $i++) { @"
+                <tr>
+                    <td>$($AnalyticsData.Charts.OperatingSystems.Labels[$i])</td>
+                    <td>$($AnalyticsData.Charts.OperatingSystems.Data[$i])</td>
+                </tr>
+"@ })
+            </tbody>
+        </table>
+    </div>
+"@ })
+    
+    $(if ($AnalyticsData.Charts.Performance) { @"
+    <div class="section">
+        <h2>Performance Distribution</h2>
+        <table>
+            <thead>
+                <tr><th>Specification</th><th>System Count</th></tr>
+            </thead>
+            <tbody>
+                $(for ($i = 0; $i -lt $AnalyticsData.Charts.Performance.Labels.Count; $i++) { @"
+                <tr>
+                    <td>$($AnalyticsData.Charts.Performance.Labels[$i])</td>
+                    <td>$($AnalyticsData.Charts.Performance.Data[$i])</td>
+                </tr>
+"@ })
+            </tbody>
+        </table>
+    </div>
+"@ })
+    
+    <div class="section">
+        <h2>Report Summary</h2>
+        <p>This analytics report provides comprehensive insights into your system inventory trends, performance metrics, and infrastructure patterns.</p>
+        <p>Use these insights to:</p>
+        <ul>
+            <li>Plan capacity and resource allocation</li>
+            <li>Identify performance bottlenecks</li>
+            <li>Track system growth and adoption</li>
+            <li>Make informed infrastructure decisions</li>
+            <li>Monitor storage and memory utilization</li>
+        </ul>
+    </div>
+</body>
+</html>
+"@
+    
+    return $htmlContent
+}
+
 #endregion
