@@ -522,6 +522,9 @@ $htmlHeader = @"
                 <a class="nav-link" href="/">
                     <i class="fas fa-list me-1"></i>Systems
                 </a>
+                <a class="nav-link" href="/assets">
+                    <i class="fas fa-clipboard-list me-1"></i>Asset Register
+                </a>
                 <a class="nav-link" href="/analytics">
                     <i class="fas fa-chart-line me-1"></i>Analytics
                 </a>
@@ -809,6 +812,21 @@ function Show-SystemDetails {
         $adapter.Fill($dataset) | Out-Null
         $disks = $dataset.Tables[0]
 
+        # Asset register info
+        Ensure-AssetRegisterSchema
+        $assetQuery = @"
+SELECT ar.AssetNumber, ISNULL(l.LocationName,'N/A') as LocationName, ar.CurrentCustodian, ar.Status, ar.IsWrittenOff, ar.LastUpdated, ar.CurrentLocationID
+FROM AssetRegister ar
+LEFT JOIN Locations l ON ar.CurrentLocationID = l.LocationID
+WHERE ar.AssetNumber = @AssetNumber
+"@
+        $cmd = New-Object System.Data.SqlClient.SqlCommand($assetQuery, $conn)
+        $cmd.Parameters.AddWithValue("@AssetNumber", $AssetNumber) | Out-Null
+        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+        $dsAsset = New-Object System.Data.DataSet
+        $adapter.Fill($dsAsset) | Out-Null
+        $assetReg = if ($dsAsset.Tables.Count -gt 0 -and $dsAsset.Tables[0].Rows.Count -gt 0) { $dsAsset.Tables[0].Rows[0] } else { $null }
+
         Return-DatabaseConnection $conn
 
         # Generate HTML for installed applications list
@@ -974,6 +992,11 @@ function Show-SystemDetails {
                             <i class="fas fa-network-wired me-1"></i>Network
                         </button>
                     </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="asset-tab" data-bs-toggle="tab" data-bs-target="#asset" type="button" role="tab">
+                            <i class="fas fa-clipboard-list me-1"></i>Asset
+                        </button>
+                    </li>
                 </ul>
                 
                 <!-- Tab content -->
@@ -1086,6 +1109,23 @@ function Show-SystemDetails {
                                     $(Render-DetailRow "DHCP Server" $details["DHCPServer"])
                                     $(Render-DetailRow "IP Config Type" $details["IPConfigType"])
                                 </table>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Asset tab -->
+                    <div class="tab-pane fade" id="asset" role="tabpanel">
+                        <div class="row mt-3">
+                            <div class="col-md-6">
+                                <h6><i class="fas fa-clipboard-list me-2"></i>Asset Register</h6>
+                                <table class="table table-sm">
+                                    $(Render-DetailRow "Location" $(if ($assetReg) { $assetReg["LocationName"] } else { "N/A" }))
+                                    $(Render-DetailRow "Custodian" $(if ($assetReg) { $assetReg["CurrentCustodian"] } else { "N/A" }))
+                                    $(Render-DetailRow "Status" $(if ($assetReg) { $assetReg["Status"] } else { "N/A" }))
+                                    $(Render-DetailRow "Written Off" $(if ($assetReg -and $assetReg["IsWrittenOff"]) { "Yes" } else { "No" }))
+                                    $(Render-DetailRow "Last Updated" $(if ($assetReg -and $assetReg["LastUpdated"]) { ([DateTime]$assetReg["LastUpdated"]).ToString("yyyy-MM-dd HH:mm") } else { "N/A" }))
+                                </table>
+                                <a class="btn btn-sm btn-outline-primary" href="/assets?AssetNumber=$(Encode-HTML $details["AssetNumber"])" target="_blank"><i class="fas fa-pen me-1"></i>Update in Asset Register</a>
                             </div>
                         </div>
                     </div>
@@ -2254,6 +2294,406 @@ function Render-AnalyticsDashboard {
 
 #endregion
 
+#region ASSET REGISTER FUNCTIONS
+
+function Ensure-AssetRegisterSchema {
+	try {
+		$conn = Get-DatabaseConnection
+		$cmd = $conn.CreateCommand()
+		$cmd.CommandText = @"
+IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'Locations')
+BEGIN
+	CREATE TABLE Locations (
+		LocationID INT IDENTITY(1,1) PRIMARY KEY,
+		LocationName NVARCHAR(100) NOT NULL,
+		LocationType NVARCHAR(50) NULL,
+		IsActive BIT NOT NULL DEFAULT 1
+	);
+	CREATE UNIQUE INDEX UX_Locations_Name ON Locations(LocationName);
+END
+
+IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'AssetRegister')
+BEGIN
+	CREATE TABLE AssetRegister (
+		RegisterID INT IDENTITY(1,1) PRIMARY KEY,
+		AssetNumber VARCHAR(50) NOT NULL,
+		CurrentLocationID INT NULL,
+		CurrentCustodian NVARCHAR(100) NULL,
+		Status NVARCHAR(50) NOT NULL DEFAULT 'Active',
+		IsWrittenOff BIT NOT NULL DEFAULT 0,
+		CheckInDate DATETIME NULL,
+		CheckOutDate DATETIME NULL,
+		Notes NVARCHAR(500) NULL,
+		LastUpdated DATETIME NOT NULL DEFAULT GETDATE()
+	);
+	CREATE INDEX IX_AssetRegister_AssetNumber ON AssetRegister(AssetNumber);
+END
+
+IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'AssetMovements')
+BEGIN
+	CREATE TABLE AssetMovements (
+		MovementID INT IDENTITY(1,1) PRIMARY KEY,
+		AssetNumber VARCHAR(50) NOT NULL,
+		FromLocationID INT NULL,
+		ToLocationID INT NULL,
+		ChangedBy NVARCHAR(100) NULL,
+		Action NVARCHAR(50) NOT NULL,
+		Notes NVARCHAR(500) NULL,
+		ChangeDate DATETIME NOT NULL DEFAULT GETDATE()
+	);
+	CREATE INDEX IX_AssetMovements_AssetNumber ON AssetMovements(AssetNumber);
+END
+"@
+		$null = $cmd.ExecuteNonQuery()
+	}
+	catch {
+		Write-Warning "Failed to ensure Asset Register schema: $_"
+	}
+	finally {
+		if ($conn) { Return-DatabaseConnection $conn }
+	}
+}
+
+function Get-Locations {
+	try {
+		$conn = Get-DatabaseConnection
+		$cmd = $conn.CreateCommand()
+		$cmd.CommandText = "SELECT LocationID, LocationName FROM Locations WHERE IsActive = 1 ORDER BY LocationName"
+		$adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+		$ds = New-Object System.Data.DataSet
+		$adapter.Fill($ds) | Out-Null
+		return $ds.Tables[0]
+	}
+	catch {
+		Write-Warning "Failed to load locations: $_"
+		return $null
+	}
+	finally {
+		if ($conn) { Return-DatabaseConnection $conn }
+	}
+}
+
+function Ensure-Location {
+	param([Parameter(Mandatory)][string]$LocationName)
+	if ([string]::IsNullOrWhiteSpace($LocationName)) { return $null }
+	try {
+		$conn = Get-DatabaseConnection
+		# Try get existing
+		$cmd = $conn.CreateCommand()
+		$cmd.CommandText = "SELECT LocationID FROM Locations WHERE LocationName = @n"
+		$cmd.Parameters.AddWithValue("@n", $LocationName) | Out-Null
+		$id = $cmd.ExecuteScalar()
+		if ($id) { return [int]$id }
+		# Insert new
+		$cmd = $conn.CreateCommand()
+		$cmd.CommandText = "INSERT INTO Locations (LocationName, IsActive) VALUES (@n, 1); SELECT CAST(SCOPE_IDENTITY() AS INT);"
+		$cmd.Parameters.AddWithValue("@n", $LocationName) | Out-Null
+		return [int]$cmd.ExecuteScalar()
+	}
+	catch {
+		Write-Warning "Failed to ensure location: $_"; return $null
+	}
+	finally {
+		if ($conn) { Return-DatabaseConnection $conn }
+	}
+}
+
+function Upsert-AssetRegister {
+	param(
+		[Parameter(Mandatory)][string]$AssetNumber,
+		[int]$CurrentLocationID,
+		[string]$CurrentCustodian,
+		[string]$Status = "Active",
+		[bool]$IsWrittenOff = $false,
+		[DateTime]$CheckInDate,
+		[DateTime]$CheckOutDate,
+		[string]$Notes
+	)
+	try {
+		$conn = Get-DatabaseConnection
+		$existsCmd = $conn.CreateCommand()
+		$existsCmd.CommandText = "SELECT 1 FROM AssetRegister WHERE AssetNumber=@a"
+		$existsCmd.Parameters.AddWithValue("@a", $AssetNumber) | Out-Null
+		$exists = $null -ne $existsCmd.ExecuteScalar()
+
+		$cmd = $conn.CreateCommand()
+		if ($exists) {
+			$cmd.CommandText = @"
+UPDATE AssetRegister
+SET CurrentLocationID=@l,
+	CurrentCustodian=@c,
+	Status=@s,
+	IsWrittenOff=@w,
+	CheckInDate=@ci,
+	CheckOutDate=@co,
+	Notes=@n,
+	LastUpdated=GETDATE()
+WHERE AssetNumber=@a
+"@
+		} else {
+			$cmd.CommandText = @"
+INSERT INTO AssetRegister (AssetNumber, CurrentLocationID, CurrentCustodian, Status, IsWrittenOff, CheckInDate, CheckOutDate, Notes, LastUpdated)
+VALUES (@a, @l, @c, @s, @w, @ci, @co, @n, GETDATE())
+"@
+		}
+		$null = $cmd.Parameters.AddWithValue("@a", $AssetNumber)
+		$null = $cmd.Parameters.AddWithValue("@l", ($(if ($null -ne $CurrentLocationID -and $CurrentLocationID -ne 0) { $CurrentLocationID } else { [DBNull]::Value })))
+		$null = $cmd.Parameters.AddWithValue("@c", ($(if ([string]::IsNullOrWhiteSpace($CurrentCustodian)) { [DBNull]::Value } else { $CurrentCustodian })))
+		$null = $cmd.Parameters.AddWithValue("@s", ($(if ([string]::IsNullOrWhiteSpace($Status)) { [DBNull]::Value } else { $Status })))
+		$null = $cmd.Parameters.AddWithValue("@w", ([int]([bool]$IsWrittenOff)))
+		$null = $cmd.Parameters.AddWithValue("@ci", ($(if ($CheckInDate) { $CheckInDate } else { [DBNull]::Value })))
+		$null = $cmd.Parameters.AddWithValue("@co", ($(if ($CheckOutDate) { $CheckOutDate } else { [DBNull]::Value })))
+		$null = $cmd.Parameters.AddWithValue("@n", ($(if ([string]::IsNullOrWhiteSpace($Notes)) { [DBNull]::Value } else { $Notes })))
+		$null = $cmd.ExecuteNonQuery()
+	}
+	catch {
+		Write-Error "Failed to upsert AssetRegister for $AssetNumber: $_"
+	}
+	finally {
+		if ($conn) { Return-DatabaseConnection $conn }
+	}
+}
+
+function Add-AssetMovement {
+	param(
+		[Parameter(Mandatory)][string]$AssetNumber,
+		[int]$FromLocationID,
+		[int]$ToLocationID,
+		[string]$ChangedBy,
+		[string]$Action = "Update",
+		[string]$Notes
+	)
+	try {
+		$conn = Get-DatabaseConnection
+		$cmd = $conn.CreateCommand()
+		$cmd.CommandText = @"
+INSERT INTO AssetMovements (AssetNumber, FromLocationID, ToLocationID, ChangedBy, Action, Notes)
+VALUES (@a, @f, @t, @u, @act, @n)
+"@
+		$null = $cmd.Parameters.AddWithValue("@a", $AssetNumber)
+		$null = $cmd.Parameters.AddWithValue("@f", ($(if ($null -ne $FromLocationID -and $FromLocationID -ne 0) { $FromLocationID } else { [DBNull]::Value })))
+		$null = $cmd.Parameters.AddWithValue("@t", ($(if ($null -ne $ToLocationID -and $ToLocationID -ne 0) { $ToLocationID } else { [DBNull]::Value })))
+		$null = $cmd.Parameters.AddWithValue("@u", ($(if ([string]::IsNullOrWhiteSpace($ChangedBy)) { [DBNull]::Value } else { $ChangedBy })))
+		$null = $cmd.Parameters.AddWithValue("@act", ($(if ([string]::IsNullOrWhiteSpace($Action)) { [DBNull]::Value } else { $Action })))
+		$null = $cmd.Parameters.AddWithValue("@n", ($(if ([string]::IsNullOrWhiteSpace($Notes)) { [DBNull]::Value } else { $Notes })))
+		$null = $cmd.ExecuteNonQuery()
+	}
+	catch {
+		Write-Warning "Failed to insert asset movement for $AssetNumber: $_"
+	}
+	finally {
+		if ($conn) { Return-DatabaseConnection $conn }
+	}
+}
+
+function Get-AssetRegisterRecords {
+	param(
+		[string]$searchTerm = "",
+		[int]$page = 1,
+		[int]$pageSize = $defaultRowCount
+	)
+	try {
+		$offset = ($page - 1) * $pageSize
+		$conn = Get-DatabaseConnection
+		$query = @"
+SELECT 
+	ar.AssetNumber,
+	s.HostName,
+	ISNULL(l.LocationName, 'N/A') AS LocationName,
+	ar.CurrentCustodian,
+	ar.Status,
+	ar.IsWrittenOff,
+	ar.CheckInDate,
+	ar.CheckOutDate,
+	ar.LastUpdated,
+	COUNT(*) OVER() AS TotalCount
+FROM AssetRegister ar
+LEFT JOIN Systems s ON ar.AssetNumber = s.AssetNumber
+LEFT JOIN Locations l ON ar.CurrentLocationID = l.LocationID
+"@
+		$where = ""
+		$params = @{}
+		if (-not [string]::IsNullOrWhiteSpace($searchTerm)) {
+			$where = "WHERE ar.AssetNumber LIKE @q OR s.HostName LIKE @q OR l.LocationName LIKE @q OR ar.Status LIKE @q"
+			$params["@q"] = "%$searchTerm%"
+		}
+		$query += @"
+$where
+ORDER BY ar.LastUpdated DESC
+OFFSET $offset ROWS FETCH NEXT $pageSize ROWS ONLY
+"@
+		$cmd = New-Object System.Data.SqlClient.SqlCommand($query, $conn)
+		foreach ($k in $params.Keys) { $cmd.Parameters.AddWithValue($k, $params[$k]) | Out-Null }
+		$adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
+		$ds = New-Object System.Data.DataSet
+		$adapter.Fill($ds) | Out-Null
+		$tbl = $ds.Tables[0]
+		return @{ Records = $tbl; TotalCount = (if ($tbl.Rows.Count -gt 0) { $tbl.Rows[0].TotalCount } else { 0 }) }
+	}
+	catch {
+		Write-Error "Failed to query asset register: $_"; return @{ Records = @(); TotalCount = 0 }
+	}
+	finally {
+		if ($conn) { Return-DatabaseConnection $conn }
+	}
+}
+
+function Read-FormData {
+	param([Parameter(Mandatory)][System.Net.HttpListenerRequest]$Request)
+	$body = ""
+	try {
+		$reader = New-Object System.IO.StreamReader($Request.InputStream, $Request.ContentEncoding)
+		$body = $reader.ReadToEnd()
+	}
+	catch { }
+	$map = @{}
+	if (-not [string]::IsNullOrWhiteSpace($body)) {
+		$parts = $body -split '&'
+		foreach ($p in $parts) {
+			$key, $val = $p.Split('=', 2)
+			$map[[System.Uri]::UnescapeDataString($key)] = if ($val) { [System.Uri]::UnescapeDataString($val) } else { "" }
+		}
+	}
+	return $map
+}
+
+function Save-AssetRegisterFromForm {
+	param([Parameter(Mandatory)][hashtable]$FormData)
+	Ensure-AssetRegisterSchema
+	$asset = $FormData["AssetNumber"]
+	$locationId = $FormData["LocationID"]
+	$locationName = $FormData["LocationName"]
+	$custodian = $FormData["CurrentCustodian"]
+	$status = if ($FormData.ContainsKey("Status")) { $FormData["Status"] } else { "Active" }
+	$isWrittenOff = if ($FormData.ContainsKey("IsWrittenOff") -and $FormData["IsWrittenOff"]) { $true } else { $false }
+	$notes = $FormData["Notes"]
+	# Determine location id
+	[int]$locId = $null
+	if ($locationId) { [void][int]::TryParse($locationId, [ref]$locId) }
+	if (-not $locId -and $locationName) { $locId = Ensure-Location -LocationName $locationName }
+	Upsert-AssetRegister -AssetNumber $asset -CurrentLocationID $locId -CurrentCustodian $custodian -Status $status -IsWrittenOff $isWrittenOff -Notes $notes
+	$changedBy = if ($env:USERNAME) { $env:USERNAME } elseif ($env:USER) { $env:USER } else { "unknown" }
+	Add-AssetMovement -AssetNumber $asset -FromLocationID $null -ToLocationID $locId -ChangedBy $changedBy -Action "RegisterOrUpdate" -Notes $notes
+}
+
+function Render-AssetRegisterPage {
+	param(
+		[string]$searchTerm = "",
+		[int]$page = 1,
+		[string]$assetNumberFilter = ""
+	)
+	Ensure-AssetRegisterSchema
+	$locations = Get-Locations
+	$data = Get-AssetRegisterRecords -searchTerm $searchTerm -page $page
+	$locationOptions = ""
+	if ($locations) {
+		foreach ($row in $locations.Rows) {
+			$locationOptions += "<option value='" + $row["LocationID"] + "'>" + (Encode-HTML $row["LocationName"]) + "</option>"
+		}
+	}
+	$registerForm = @"
+	<div class="card mb-4">
+		<div class="card-header bg-secondary text-white">
+			<i class="fas fa-clipboard-list me-2"></i>Register / Update Asset
+		</div>
+		<div class="card-body">
+			<form method="POST" action="/assets/save" class="row g-3">
+				<input type="hidden" name="redirect" value="/assets" />
+				<div class="col-md-3">
+					<label class="form-label">Asset Number</label>
+					<input type="text" name="AssetNumber" class="form-control" required value="$(Encode-HTML $assetNumberFilter)" />
+				</div>
+				<div class="col-md-3">
+					<label class="form-label">Location</label>
+					<select name="LocationID" class="form-select">
+						<option value="">-- Select --</option>
+						$locationOptions
+					</select>
+					<small class="text-muted">Or add new location below</small>
+					<input type="text" name="LocationName" class="form-control mt-1" placeholder="New location name" />
+				</div>
+				<div class="col-md-3">
+					<label class="form-label">Custodian</label>
+					<input type="text" name="CurrentCustodian" class="form-control" />
+				</div>
+				<div class="col-md-2">
+					<label class="form-label">Status</label>
+					<select name="Status" class="form-select">
+						<option>Active</option>
+						<option>In IT</option>
+						<option>Issued</option>
+						<option>In Repair</option>
+						<option>Disposed</option>
+						<option>WrittenOff</option>
+					</select>
+				</div>
+				<div class="col-md-1 d-flex align-items-end">
+					<div class="form-check">
+						<input class="form-check-input" type="checkbox" name="IsWrittenOff" id="isWrittenOff">
+						<label class="form-check-label" for="isWrittenOff">Written off</label>
+					</div>
+				</div>
+				<div class="col-12">
+					<label class="form-label">Notes</label>
+					<textarea name="Notes" class="form-control" rows="2"></textarea>
+				</div>
+				<div class="col-12">
+					<button type="submit" class="btn btn-primary"><i class="fas fa-save me-1"></i>Save</button>
+				</div>
+			</form>
+		</div>
+	</div>
+"@
+	$rowsHtml = ""
+	foreach ($r in $data.Records.Rows) {
+		$rowsHtml += @"
+		<tr>
+			<td><a href="/?AssetNumber=$(Encode-HTML $r["AssetNumber"])" class="text-decoration-none">$(Encode-HTML $r["AssetNumber"])</a></td>
+			<td>$(Encode-HTML $r["HostName"])</td>
+			<td>$(Encode-HTML $r["LocationName"])</td>
+			<td>$(Encode-HTML $r["CurrentCustodian"])</td>
+			<td>$(Encode-HTML $r["Status"])</td>
+			<td>$(if ($r["IsWrittenOff"]) { "Yes" } else { "No" })</td>
+			<td>$(if ($r["LastUpdated"]) { ([DateTime]$r["LastUpdated"]).ToString("yyyy-MM-dd HH:mm") } else { "" })</td>
+		</tr>
+"@
+	}
+	$searchForm = @"
+	<div class="card search-box mb-4"><div class="card-body">
+		<form method="GET" action="/assets" class="row g-3">
+			<div class="col-md-8"><div class="input-group">
+				<span class="input-group-text"><i class="fas fa-search"></i></span>
+				<input type="text" class="form-control" name="search" placeholder="Search by asset, host, location or status..." value="$(Encode-HTML $searchTerm)">
+			</div></div>
+			<div class="col-md-4">
+				<button type="submit" class="btn btn-primary me-2"><i class="fas fa-search me-1"></i>Search</button>
+				<a href="/assets" class="btn btn-outline-secondary"><i class="fas fa-times me-1"></i>Clear</a>
+			</div>
+		</form>
+	</div></div>
+"@
+	$html = $htmlHeader + $searchForm + $registerForm + @"
+	<div class="card">
+		<div class="card-header bg-primary text-white">
+			<i class="fas fa-clipboard-list me-2"></i>Asset Register
+		</div>
+		<div class="card-body">
+			<div class="table-responsive">
+				<table class="table table-sm table-striped datatable">
+					<thead><tr><th>Asset</th><th>Host</th><th>Location</th><th>Custodian</th><th>Status</th><th>Written Off</th><th>Updated</th></tr></thead>
+					<tbody>
+						$rowsHtml
+					</tbody>
+				</table>
+			</div>
+		</div>
+	</div>
+"@ + $htmlFooter
+	return $html
+}
+
+#endregion
+
 #region WEB SERVER
 
 # Start health monitoring
@@ -2383,6 +2823,36 @@ try {
                     $duration = ((Get-Date) - $startTime).TotalMilliseconds
                     Log-Performance -operation "ExportAnalytics" -durationMs $duration -details "Format=$format, TimeRange=$timeRange"
                     
+                    continue
+                }
+
+                # Handle Asset Register page
+                if ($request.Url.LocalPath -eq "/assets") {
+                    $searchTerm = if ($queryParams.ContainsKey("search")) { $queryParams["search"] } else { "" }
+                    $page = if ($queryParams.ContainsKey("page")) { [int]$queryParams["page"] } else { 1 }
+                    $assetNum = if ($queryParams.ContainsKey("AssetNumber")) { $queryParams["AssetNumber"] } else { "" }
+                    $html = Render-AssetRegisterPage -searchTerm $searchTerm -page $page -assetNumberFilter $assetNum
+                    $buffer = [System.Text.Encoding]::UTF8.GetBytes($html)
+                    $response.ContentLength64 = $buffer.Length
+                    $response.ContentType = "text/html; charset=utf-8"
+                    $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                    $response.OutputStream.Close()
+                    continue
+                }
+
+                # Handle Asset Register save
+                if ($request.Url.LocalPath -eq "/assets/save") {
+                    if ($request.HttpMethod -ne "POST") {
+                        $response.StatusCode = 405
+                        $response.OutputStream.Close()
+                        continue
+                    }
+                    $form = Read-FormData -Request $request
+                    Save-AssetRegisterFromForm -FormData $form
+                    $redirect = if ($form.ContainsKey("redirect")) { $form["redirect"] } else { "/assets" }
+                    $response.StatusCode = 302
+                    $response.AddHeader("Location", $redirect)
+                    $response.OutputStream.Close()
                     continue
                 }
 
