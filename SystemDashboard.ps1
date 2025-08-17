@@ -37,6 +37,7 @@ $defaultConfig = @{
     EnableHTTPS = $false
     CertificatePath = ""
     HealthCheckInterval = 60
+    AssetRegisterEnabled = $true
 }
 
 # Load or create configuration
@@ -69,6 +70,7 @@ $defaultRowCount = $config.DefaultRowCount
 $connectionString = $config.ConnectionString
 $enablePerformanceLogging = $config.EnablePerformanceLogging
 $performanceLogPath = $config.PerformanceLogPath
+$assetRegisterEnabled = $config.AssetRegisterEnabled
 #endregion
 
 #region GLOBAL VARIABLES AND STATE
@@ -103,6 +105,8 @@ $script:requestStats = @{
     AverageResponseTime = 0
     LastReset = Get-Date
 }
+
+$script:schemaInitLock = [System.Threading.ReaderWriterLockSlim]::new()
 #endregion
 
 # Load required SQL module
@@ -2297,7 +2301,9 @@ function Render-AnalyticsDashboard {
 #region ASSET REGISTER FUNCTIONS
 
 function Ensure-AssetRegisterSchema {
+	if (-not $assetRegisterEnabled) { return }
 	try {
+		$script:schemaInitLock.EnterWriteLock()
 		$conn = Get-DatabaseConnection
 		$cmd = $conn.CreateCommand()
 		$cmd.CommandText = @"
@@ -2307,7 +2313,9 @@ BEGIN
 		LocationID INT IDENTITY(1,1) PRIMARY KEY,
 		LocationName NVARCHAR(100) NOT NULL,
 		LocationType NVARCHAR(50) NULL,
-		IsActive BIT NOT NULL DEFAULT 1
+		IsActive BIT NOT NULL DEFAULT 1,
+		DateCreated DATETIME NOT NULL DEFAULT GETDATE(),
+		CreatedBy NVARCHAR(100) NULL
 	);
 	CREATE UNIQUE INDEX UX_Locations_Name ON Locations(LocationName);
 END
@@ -2324,7 +2332,8 @@ BEGIN
 		CheckInDate DATETIME NULL,
 		CheckOutDate DATETIME NULL,
 		Notes NVARCHAR(500) NULL,
-		LastUpdated DATETIME NOT NULL DEFAULT GETDATE()
+		LastUpdated DATETIME NOT NULL DEFAULT GETDATE(),
+		LastUpdatedBy NVARCHAR(100) NULL
 	);
 	CREATE INDEX IX_AssetRegister_AssetNumber ON AssetRegister(AssetNumber);
 END
@@ -2342,6 +2351,7 @@ BEGIN
 		ChangeDate DATETIME NOT NULL DEFAULT GETDATE()
 	);
 	CREATE INDEX IX_AssetMovements_AssetNumber ON AssetMovements(AssetNumber);
+	CREATE INDEX IX_AssetMovements_ChangeDate ON AssetMovements(ChangeDate);
 END
 "@
 		$null = $cmd.ExecuteNonQuery()
@@ -2351,10 +2361,12 @@ END
 	}
 	finally {
 		if ($conn) { Return-DatabaseConnection $conn }
+		$script:schemaInitLock.ExitWriteLock()
 	}
 }
 
 function Get-Locations {
+	if (-not $assetRegisterEnabled) { return $null }
 	try {
 		$conn = Get-DatabaseConnection
 		$cmd = $conn.CreateCommand()
@@ -2375,7 +2387,7 @@ function Get-Locations {
 
 function Ensure-Location {
 	param([Parameter(Mandatory)][string]$LocationName)
-	if ([string]::IsNullOrWhiteSpace($LocationName)) { return $null }
+	if (-not $assetRegisterEnabled -or [string]::IsNullOrWhiteSpace($LocationName)) { return $null }
 	try {
 		$conn = Get-DatabaseConnection
 		# Try get existing
@@ -2399,6 +2411,7 @@ function Ensure-Location {
 }
 
 function Upsert-AssetRegister {
+	if (-not $assetRegisterEnabled) { return }
 	param(
 		[Parameter(Mandatory)][string]$AssetNumber,
 		[int]$CurrentLocationID,
@@ -2455,6 +2468,7 @@ VALUES (@a, @l, @c, @s, @w, @ci, @co, @n, GETDATE())
 }
 
 function Add-AssetMovement {
+	if (-not $assetRegisterEnabled) { return }
 	param(
 		[Parameter(Mandatory)][string]$AssetNumber,
 		[int]$FromLocationID,
@@ -2487,6 +2501,7 @@ VALUES (@a, @f, @t, @u, @act, @n)
 }
 
 function Get-AssetRegisterRecords {
+	if (-not $assetRegisterEnabled) { return @{ Records = @(); TotalCount = 0 } }
 	param(
 		[string]$searchTerm = "",
 		[int]$page = 1,
@@ -2559,6 +2574,7 @@ function Read-FormData {
 
 function Save-AssetRegisterFromForm {
 	param([Parameter(Mandatory)][hashtable]$FormData)
+	if (-not $assetRegisterEnabled) { return $false }
 	Ensure-AssetRegisterSchema
 	$asset = $FormData["AssetNumber"]
 	$locationId = $FormData["LocationID"]
@@ -2574,6 +2590,7 @@ function Save-AssetRegisterFromForm {
 	Upsert-AssetRegister -AssetNumber $asset -CurrentLocationID $locId -CurrentCustodian $custodian -Status $status -IsWrittenOff $isWrittenOff -Notes $notes
 	$changedBy = if ($env:USERNAME) { $env:USERNAME } elseif ($env:USER) { $env:USER } else { "unknown" }
 	Add-AssetMovement -AssetNumber $asset -FromLocationID $null -ToLocationID $locId -ChangedBy $changedBy -Action "RegisterOrUpdate" -Notes $notes
+	return $true
 }
 
 function Render-AssetRegisterPage {
@@ -2582,6 +2599,7 @@ function Render-AssetRegisterPage {
 		[int]$page = 1,
 		[string]$assetNumberFilter = ""
 	)
+	if (-not $assetRegisterEnabled) { return "<div class='alert alert-warning'>Asset Register functionality is disabled in configuration</div>" }
 	Ensure-AssetRegisterSchema
 	$locations = Get-Locations
 	$data = Get-AssetRegisterRecords -searchTerm $searchTerm -page $page
