@@ -288,6 +288,52 @@ function Get-ColumnList {
 
 #endregion Helper Functions
 
+#region Asset Register Integration
+
+function Upsert-AssetRegisterDuringImport {
+	param(
+		[Parameter(Mandatory)][string]$AssetNumber,
+		[Parameter(Mandatory)][System.Data.SqlClient.SqlConnection]$Connection,
+		[Parameter(Mandatory)][System.Data.SqlClient.SqlTransaction]$Transaction,
+		[string]$Status = "In IT"
+	)
+	try {
+		$cmd = $Connection.CreateCommand()
+		$cmd.Transaction = $Transaction
+		$cmd.CommandText = @"
+IF NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'AssetRegister')
+BEGIN
+	CREATE TABLE AssetRegister (
+		RegisterID INT IDENTITY(1,1) PRIMARY KEY,
+		AssetNumber VARCHAR(50) NOT NULL,
+		CurrentLocationID INT NULL,
+		CurrentCustodian NVARCHAR(100) NULL,
+		Status NVARCHAR(50) NOT NULL DEFAULT 'Active',
+		IsWrittenOff BIT NOT NULL DEFAULT 0,
+		CheckInDate DATETIME NULL,
+		CheckOutDate DATETIME NULL,
+		Notes NVARCHAR(500) NULL,
+		LastUpdated DATETIME NOT NULL DEFAULT GETDATE()
+	);
+	CREATE INDEX IX_AssetRegister_AssetNumber ON AssetRegister(AssetNumber);
+END
+
+IF EXISTS (SELECT 1 FROM AssetRegister WHERE AssetNumber=@a)
+	UPDATE AssetRegister SET Status=@s, LastUpdated=GETDATE() WHERE AssetNumber=@a
+ELSE
+	INSERT INTO AssetRegister (AssetNumber, Status, LastUpdated) VALUES (@a, @s, GETDATE());
+"@
+		$null = $cmd.Parameters.AddWithValue("@a", $AssetNumber)
+		$null = $cmd.Parameters.AddWithValue("@s", $Status)
+		$cmd.ExecuteNonQuery() | Out-Null
+	}
+	catch {
+		Write-Warning "Asset register upsert during import failed for ${AssetNumber}: $_"
+	}
+}
+
+#endregion Asset Register Integration
+
 #region Import Functions
 
 function Import-SystemRecord {
@@ -877,6 +923,10 @@ try {
             Write-Host "  💾 Importing software information..." -ForegroundColor DarkYellow
             Import-Software -AssetNumber $assetNumber -SoftwareData $json.Software -Connection $conn -Transaction $tran
             Write-Host "  ✅ Software information imported" -ForegroundColor DarkGreen
+
+            Write-Host "  💾 Upserting Asset Register..." -ForegroundColor DarkYellow
+            Upsert-AssetRegisterDuringImport -AssetNumber $assetNumber -Connection $conn -Transaction $tran
+            Write-Host "  ✅ Asset Register upserted" -ForegroundColor DarkGreen
 
             Write-Host "  💾 Committing transaction..." -ForegroundColor DarkYellow
             $tran.Commit()
