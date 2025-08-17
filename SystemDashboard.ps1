@@ -2211,7 +2211,7 @@ function Render-AnalyticsDashboard {
         // Performance Distribution Chart
         const performanceCtx = document.getElementById('performanceChart').getContext('2d');
         new Chart(performanceCtx, {
-            type: 'horizontalBar',
+            type: 'bar',
             data: {
                 labels: analyticsData.Charts.Performance.Labels,
                 datasets: [{
@@ -2221,6 +2221,7 @@ function Render-AnalyticsDashboard {
                 }]
             },
             options: {
+                indexAxis: 'y',
                 responsive: true,
                 plugins: {
                     title: {
@@ -2249,7 +2250,7 @@ function Render-AnalyticsDashboard {
     </script>
 "@
     
-    return $html
+    return $htmlHeader + $html + $htmlFooter
 }
 
 #endregion
