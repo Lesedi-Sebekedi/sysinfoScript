@@ -11,7 +11,7 @@
     .AUTHOR
         Lesedi Sebekedi
     .VERSION
-        2.1
+        2.0
 #>
 
 function Get-SystemInfo {
@@ -44,21 +44,20 @@ function Get-SystemInfo {
 
         # REGION: PROCESSOR INFORMATION
         Write-Host "    Collecting processor information..." -ForegroundColor DarkYellow
-        
-        # Get CPU information with proper numeric extraction
+        $cpuParams = @{
+            Property = @(
+                'Name'
+                @{Name="Cores"; Expression={$_.NumberOfCores}}
+                @{Name="Threads"; Expression={$_.NumberOfLogicalProcessors}}
+                @{Name="ClockSpeed"; Expression={"$($_.MaxClockSpeed) MHz"}}
+            )
+        }
+
         if ($useCim) {
-            $cpuInfo = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | Select-Object -First 1
+            $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | Select-Object @cpuParams
         } 
         else {
-            $cpuInfo = Get-WmiObject -Class Win32_Processor -ErrorAction Stop | Select-Object -First 1
-        }
-        
-        # Create CPU object with proper numeric values
-        $cpu = New-Object PSObject -Property @{
-            Name = $cpuInfo.Name
-            Cores = [int]$cpuInfo.NumberOfCores
-            Threads = [int]$cpuInfo.NumberOfLogicalProcessors
-            ClockSpeed = "$([int]$cpuInfo.MaxClockSpeed) MHz"
+            $cpu = Get-WmiObject -Class Win32_Processor -ErrorAction Stop | Select-Object @cpuParams
         }
         Write-Host "   Processor information collected" -ForegroundColor DarkGreen
 
@@ -77,61 +76,42 @@ function Get-SystemInfo {
                        Select-Object @{Name="PageFileGB"; Expression={[math]::Round($_.AllocatedBaseSize / 1KB, 2)}}
         }
         
-        # Use culture-invariant formatting for numbers
         $totalMemoryGB = if ($physicalMemory.Sum) { 
-            [math]::Round(($physicalMemory.Sum / 1GB), 2).ToString([System.Globalization.NumberFormatInfo]::InvariantInfo)
+            [math]::Round(($physicalMemory.Sum / 1GB), 2) 
         } else { 
-            "0" 
+            0 
         }
-        
-        $pageFileGB = if ($pageFile -and $pageFile.PageFileGB) { 
-            $pageFile.PageFileGB.ToString([System.Globalization.NumberFormatInfo]::InvariantInfo)
-        } else { 
-            "0" 
-        }
-        
         Write-Host "   Memory information collected ($totalMemoryGB GB)" -ForegroundColor DarkGreen
 
         # REGION: STORAGE INFORMATION
         Write-Host "   Collecting storage information..." -ForegroundColor DarkYellow
-        
+        $diskParams = @{
+            Property = @(
+                'DeviceID'
+                'VolumeName'
+                @{Name="SizeGB"; Expression={[math]::Round($_.Size / 1GB, 2)}}
+                @{Name="FreeGB"; Expression={[math]::Round($_.FreeSpace / 1GB, 2)}}
+                @{Name="Type"; Expression={
+                    switch($_.DriveType) {
+                        2 {"Removable"}
+                        3 {"Fixed"} 
+                        4 {"Network"}
+                        5 {"Optical"}
+                        default {"Unknown"}
+                    }
+                }}
+            )
+        }
+
         if ($useCim) {
             $disks = Get-CimInstance -ClassName Win32_LogicalDisk -ErrorAction SilentlyContinue | 
                     Where-Object { $_.Size -gt 0 } | 
-                    ForEach-Object {
-                        New-Object PSObject -Property @{
-                            DeviceID = $_.DeviceID
-                            VolumeName = $_.VolumeName
-                            SizeGB = [math]::Round($_.Size / 1GB, 2).ToString([System.Globalization.NumberFormatInfo]::InvariantInfo)
-                            FreeGB = [math]::Round($_.FreeSpace / 1GB, 2).ToString([System.Globalization.NumberFormatInfo]::InvariantInfo)
-                            Type = switch($_.DriveType) {
-                                2 {"Removable"}
-                                3 {"Fixed"} 
-                                4 {"Network"}
-                                5 {"Optical"}
-                                default {"Unknown"}
-                            }
-                        }
-                    }
+                    Select-Object @diskParams
         } 
         else {
             $disks = Get-WmiObject -Class Win32_LogicalDisk -ErrorAction SilentlyContinue | 
                     Where-Object { $_.Size -gt 0 } | 
-                    ForEach-Object {
-                        New-Object PSObject -Property @{
-                            DeviceID = $_.DeviceID
-                            VolumeName = $_.VolumeName
-                            SizeGB = [math]::Round($_.Size / 1GB, 2).ToString([System.Globalization.NumberFormatInfo]::InvariantInfo)
-                            FreeGB = [math]::Round($_.FreeSpace / 1GB, 2).ToString([System.Globalization.NumberFormatInfo]::InvariantInfo)
-                            Type = switch($_.DriveType) {
-                                2 {"Removable"}
-                                3 {"Fixed"} 
-                                4 {"Network"}
-                                5 {"Optical"}
-                                default {"Unknown"}
-                            }
-                        }
-                    }
+                    Select-Object @diskParams
         }
         Write-Host "   Storage information collected ($(($disks | Measure-Object).Count) drives)" -ForegroundColor DarkGreen
 
@@ -142,32 +122,14 @@ function Get-SystemInfo {
         # PS2.0 compatible network adapter collection
         $adapters = Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true }
         foreach ($adapter in $adapters) {
-            # Convert CIDR prefix length to subnet mask
-            $subnetMask = $null
-            if ($adapter.IPSubnet -and $adapter.IPSubnet[0]) {
-                $prefixLength = $adapter.IPSubnet[0]
-                if ($prefixLength -match '^\d+$') {
-                    # Convert CIDR to subnet mask
-                    $cidr = [int]$prefixLength
-                    if ($cidr -ge 0 -and $cidr -le 32) {
-                        $mask = ([math]::Pow(2, 32) - [math]::Pow(2, (32 - $cidr)))
-                        $subnetMask = "$([math]::Floor($mask / 16777216) % 256).$([math]::Floor($mask / 65536) % 256).$([math]::Floor($mask / 256) % 256).$($mask % 256)"
-                    } else {
-                        $subnetMask = $prefixLength
-                    }
-                } else {
-                    $subnetMask = $prefixLength
-                }
-            }
-            
             $networkAdapters += New-Object PSObject -Property @{
-                Name = $adapter.Description
-                IPAddress = if ($adapter.IPAddress) { $adapter.IPAddress[0] } else { $null }
-                SubnetMask = $subnetMask
+                Name           = $adapter.Description
+                IPAddress      = if ($adapter.IPAddress) { $adapter.IPAddress[0] } else { $null }
+                SubnetMask     = if ($adapter.IPSubnet) { $adapter.IPSubnet[0] } else { $null }
                 DefaultGateway = if ($adapter.DefaultIPGateway) { $adapter.DefaultIPGateway[0] } else { $null }
-                DNSServers = if ($adapter.DNSServerSearchOrder) { $adapter.DNSServerSearchOrder -join ',' } else { $null }
-                DHCPEnabled = [bool]$adapter.DHCPEnabled
-                MacAddress = $adapter.MACAddress
+                DNSServers     = if ($adapter.DNSServerSearchOrder) { $adapter.DNSServerSearchOrder -join ',' } else { $null }
+                DHCPEnabled    = $adapter.DHCPEnabled
+                MacAddress     = $adapter.MACAddress
             }
         }
         Write-Host "   Network configuration collected ($(($networkAdapters | Measure-Object).Count) adapters)" -ForegroundColor DarkGreen
@@ -193,26 +155,17 @@ function Get-SystemInfo {
         Write-Host "Collecting hardware identifiers..." -ForegroundColor DarkYellow
         if ($useCim) {
             $uuid = (Get-CimInstance -ClassName Win32_ComputerSystemProduct -ErrorAction SilentlyContinue).UUID
-            $gpuInfo = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -First 1
+            $gpu = Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue | 
+                   Select-Object Name, 
+                       @{Name="AdapterRAMGB"; Expression={[math]::Round($_.AdapterRAM / 1GB, 2)}}, 
+                       DriverVersion
         } 
         else {
             $uuid = (Get-WmiObject -Class Win32_ComputerSystemProduct -ErrorAction SilentlyContinue).UUID
-            $gpuInfo = Get-WmiObject -Class Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -First 1
-        }
-
-        # Create GPU object with culture-invariant formatting
-        $gpu = if ($gpuInfo) {
-            New-Object PSObject -Property @{
-                Name = $gpuInfo.Name
-                AdapterRAMGB = [math]::Round($gpuInfo.AdapterRAM / 1GB, 2).ToString([System.Globalization.NumberFormatInfo]::InvariantInfo)
-                DriverVersion = $gpuInfo.DriverVersion
-            }
-        } else {
-            New-Object PSObject -Property @{
-                Name = "Unknown"
-                AdapterRAMGB = "0"
-                DriverVersion = "Unknown"
-            }
+            $gpu = Get-WmiObject -Class Win32_VideoController -ErrorAction SilentlyContinue | 
+                   Select-Object Name, 
+                       @{Name="AdapterRAMGB"; Expression={[math]::Round($_.AdapterRAM / 1GB, 2)}}, 
+                       DriverVersion
         }
 
         if (-not $uuid) { 
@@ -233,7 +186,7 @@ function Get-SystemInfo {
         $memoryObj = New-Object PSObject -Property @{
             TotalGB = $totalMemoryGB
             Sticks = $physicalMemory.Count
-            PageFileGB = $pageFileGB
+            PageFileGB = if ($pageFile) { $pageFile.PageFileGB } else { 0 }
         }
         
         $hardwareObj = New-Object PSObject -Property @{
@@ -305,7 +258,7 @@ function Test-DataIntegrity {
     return $warnings
 }
 
-# JSON conversion function for PS2.0 with proper numeric formatting
+# JSON conversion function for PS2.0
 function ConvertTo-Json20 {
     param(
         $obj,
@@ -333,8 +286,7 @@ function ConvertTo-Json20 {
         $js.AppendFormat('{0}', $obj.ToString().ToLower()) | Out-Null
     }
     elseif ($obj -is [int] -or $obj -is [float] -or $obj -is [double] -or $obj -is [decimal]) {
-        # Use culture-invariant formatting for numbers
-        $js.AppendFormat('{0}', $obj.ToString([System.Globalization.NumberFormatInfo]::InvariantInfo)) | Out-Null
+        $js.AppendFormat('{0}', $obj) | Out-Null
     }
     elseif ($obj -is [array]) {
         $js.Append("[$newLine") | Out-Null
@@ -385,7 +337,7 @@ function ConvertTo-Json20 {
 }
 
 # MAIN EXECUTION
-Write-Host " System Information Collector v2.1 (PS2.0 Compatible)" -ForegroundColor Cyan
+Write-Host " System Information Collector v2.0 (PS2.0 Compatible)" -ForegroundColor Cyan
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host "North West Provincial Treasury" -ForegroundColor DarkGray
 Write-Host "Author: Lesedi Sebekedi" -ForegroundColor DarkGray
@@ -396,16 +348,9 @@ do {
     $assetNumber = Read-Host "Please enter the Asset Number for this system (required)"
     if ([string]::IsNullOrWhiteSpace($assetNumber)) {
         Write-Host " Asset Number cannot be empty!" -ForegroundColor Red
-    } elseif ($assetNumber -notmatch '^\d{11}$') {
-        Write-Host " Asset Number must be exactly 11 digits!" -ForegroundColor Red
-        Write-Host "   Example format: 07001234567" -ForegroundColor DarkYellow
-    } elseif ($assetNumber -notmatch '^0700') {
-        Write-Host " Warning: Asset Number doesn't start with '0700' (current: $assetNumber)" -ForegroundColor Yellow
-        $confirm = Read-Host "Continue anyway? (y/n)"
-        if ($confirm -eq 'y' -or $confirm -eq 'Y') {
-            Write-Host " Asset Number accepted: $assetNumber" -ForegroundColor Green
-            break
-        }
+    } elseif ($assetNumber -notmatch '^[A-Z0-9]+$') {
+        Write-Host " Asset Number should contain only letters and numbers!" -ForegroundColor Red
+        Write-Host "   Example format: ABC123456" -ForegroundColor DarkYellow
     } else {
         Write-Host " Asset Number format is valid: $assetNumber" -ForegroundColor Green
         break
@@ -455,12 +400,12 @@ if ($systemInfo) {
 
     # Generate filename
     $computerName = $env:COMPUTERNAME -replace '[\\/:*?"<>|]', '_'
-    $reportPath = "$outputDir\$computerName-$assetFileName.json"
+    $reportPath = "$outputDir\$computerName-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
 
     Write-Host "   Exporting to JSON file..." -ForegroundColor DarkYellow
     
     # Export to JSON (using our PS2.0 compatible function)
-    ConvertTo-Json20 $systemInfo | Out-File -FilePath $reportPath -Force -Encoding UTF8
+    ConvertTo-Json20 $systemInfo | Out-File -FilePath $reportPath -Force
 
     # Verify export
     if (Test-Path $reportPath -PathType Leaf) {
@@ -481,18 +426,6 @@ if ($systemInfo) {
             Write-Host "   - Memory: $($systemInfo.Hardware.Memory.TotalGB) GB" -ForegroundColor DarkGray
             Write-Host "   - Network Adapters: $(($systemInfo.Network | Measure-Object).Count)" -ForegroundColor DarkGray
             Write-Host "   - Applications: $(($systemInfo.Software.InstalledApps | Measure-Object).Count)" -ForegroundColor DarkGray
-            
-            # Quick validation of JSON content
-            try {
-                $jsonContent = Get-Content $reportPath -Raw
-                if ($jsonContent -match ',') {
-                    Write-Host "   - JSON Validation: WARNING - Commas detected in numeric values" -ForegroundColor Yellow
-                } else {
-                    Write-Host "   - JSON Validation: PASSED" -ForegroundColor Green
-                }
-            } catch {
-                Write-Host "   - JSON Validation: ERROR - $($_.Exception.Message)" -ForegroundColor Red
-            }
         }
     }
 }

@@ -12,5 +12,6 @@
   "CacheTimeout": 300,
   "EnableHTTPS": false,
   "CertificatePath": "",
-  "HealthCheckInterval": 60
+  "HealthCheckInterval": 60,
+  "AssetRegisterEnabled": true
 }
